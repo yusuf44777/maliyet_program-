@@ -1,0 +1,47 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-gray-50 text-gray-900;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+/* Tablo stilleri */
+.table-container {
+  @apply overflow-x-auto rounded-lg border border-gray-200;
+}
+
+.table-container table {
+  @apply w-full text-sm;
+}
+
+.table-container th {
+  @apply bg-gray-100 px-3 py-2 text-left font-semibold text-gray-700 border-b border-gray-200 whitespace-nowrap;
+}
+
+.table-container td {
+  @apply px-3 py-2 border-b border-gray-100 whitespace-nowrap;
+}
+
+.table-container tr:hover td {
+  @apply bg-blue-50;
+}
+
+/* Badge stilleri */
+.badge {
+  @apply inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium;
+}
+
+.badge-metal {
+  @apply bg-slate-100 text-slate-700;
+}
+
+.badge-ahsap {
+  @apply bg-amber-100 text-amber-700;
+}
+
+/* Alan değeri highlight */
+.alan-value {
+  @apply font-mono text-blue-700 bg-blue-50 px-2 py-0.5 rounded;
+}
