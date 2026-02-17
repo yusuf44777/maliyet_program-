@@ -1,1 +1,28 @@
-/.DS_Store
+# macOS
+.DS_Store
+
+# Python / backend
+backend/.venv/
+backend/__pycache__/
+backend/*.py[cod]
+backend/.pytest_cache/
+backend/.mypy_cache/
+backend/.ruff_cache/
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Local env/secrets
+backend/.env
+frontend/.env
+
+# Local databases and runtime output
+backend/maliyet.db
+backend/maliyet.db.*
+exports/
+
+# Logs/temp
+*.log
+*.tmp
