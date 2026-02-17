@@ -20,6 +20,26 @@ except Exception:
     RealDictCursor = None
     PgIntegrityError = None
 
+# Vercel ortamında psycopg2 yoksa psycopg (v3) compat katmanını dene
+if psycopg2 is None:
+    try:
+        from psycopg import connect as _psycopg3_connect
+        from psycopg.rows import dict_row as _psycopg3_dict_row
+        from psycopg import errors as _psycopg3_errors
+
+        class _Psycopg3Compat:
+            """psycopg2 API'sine benzer ince wrapper — sadece kullandığımız kısımlar."""
+            @staticmethod
+            def connect(dsn):
+                conn = _psycopg3_connect(dsn, row_factory=_psycopg3_dict_row, autocommit=False)
+                return conn
+
+        psycopg2 = _Psycopg3Compat()
+        RealDictCursor = None  # psycopg3'te dict_row zaten row_factory olarak set ediliyor
+        PgIntegrityError = _psycopg3_errors.IntegrityError
+    except Exception:
+        pass
+
 try:
     import pandas as pd
 except Exception:
@@ -121,7 +141,9 @@ class PGCompatConnection:
         self._inner = inner
 
     def cursor(self):
-        return PGCompatCursor(self._inner.cursor(cursor_factory=RealDictCursor))
+        if RealDictCursor is not None:
+            return PGCompatCursor(self._inner.cursor(cursor_factory=RealDictCursor))
+        return PGCompatCursor(self._inner.cursor())
 
     def execute(self, sql: str, params=None):
         cur = self.cursor()
@@ -213,9 +235,12 @@ def get_db():
     """Aktif backend'e göre DB bağlantısı döndürür."""
     if IS_POSTGRES:
         if psycopg2 is None:
-            raise RuntimeError("PostgreSQL için 'psycopg2-binary' kurulmalı.")
+            raise RuntimeError("PostgreSQL için 'psycopg2-binary' veya 'psycopg' kurulmalı.")
         raw_conn = psycopg2.connect(DATABASE_URL)
-        raw_conn.autocommit = False
+        try:
+            raw_conn.autocommit = False
+        except Exception:
+            pass  # psycopg3 compat: autocommit zaten connect()'te ayarlandı
         return PGCompatConnection(raw_conn)
 
     conn = sqlite3.connect(str(DB_PATH))
