@@ -69,7 +69,7 @@ def parse_cors_origins() -> list[str]:
 
 ALLOWED_CORS_ORIGINS = parse_cors_origins()
 ENABLE_RELOAD_DB = env_flag("ENABLE_RELOAD_DB", default=not IS_PRODUCTION)
-SEED_DEFAULT_USERS = env_flag("SEED_DEFAULT_USERS", default=not IS_PRODUCTION)
+SEED_DEFAULT_USERS = env_flag("SEED_DEFAULT_USERS", default=True)
 
 app.add_middleware(
     CORSMiddleware,
@@ -393,10 +393,10 @@ def ensure_default_users():
     if not SEED_DEFAULT_USERS:
         return
 
-    admin_username = os.getenv("DEFAULT_ADMIN_USERNAME", "admin" if not IS_PRODUCTION else "").strip()
-    admin_password = os.getenv("DEFAULT_ADMIN_PASSWORD", "admin123" if not IS_PRODUCTION else "").strip()
-    user_username = os.getenv("DEFAULT_USER_USERNAME", "user" if not IS_PRODUCTION else "").strip()
-    user_password = os.getenv("DEFAULT_USER_PASSWORD", "user123" if not IS_PRODUCTION else "").strip()
+    admin_username = os.getenv("DEFAULT_ADMIN_USERNAME", "admin").strip()
+    admin_password = os.getenv("DEFAULT_ADMIN_PASSWORD", "admin").strip()
+    user_username = os.getenv("DEFAULT_USER_USERNAME", "user").strip()
+    user_password = os.getenv("DEFAULT_USER_PASSWORD", "user123").strip()
 
     defaults = []
     if admin_username and admin_password:
@@ -420,10 +420,16 @@ def ensure_default_users():
     conn = get_db()
     for u in defaults:
         existing = conn.execute(
-            "SELECT id FROM users WHERE lower(username) = lower(?)",
+            "SELECT id, password_hash FROM users WHERE lower(username) = lower(?)",
             (u["username"],),
         ).fetchone()
         if existing:
+            # Mevcut kullanıcının parolası varsayılan ile uyuşmuyorsa güncelle
+            if not verify_password(u["password"], existing["password_hash"]):
+                conn.execute(
+                    "UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (hash_password(u["password"]), existing["id"]),
+                )
             continue
         conn.execute(
             """

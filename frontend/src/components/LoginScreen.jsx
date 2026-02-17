@@ -72,7 +72,7 @@ export default function LoginScreen({ onLogin }) {
         {SHOW_DEFAULT_LOGIN_HINTS && (
           <div className="mt-4 text-xs text-gray-500 bg-gray-50 border border-gray-100 rounded-lg p-3">
             Varsayılan hesaplar:
-            <div className="mt-1 font-mono">admin / admin123</div>
+            <div className="mt-1 font-mono">admin / admin</div>
             <div className="font-mono">user / user123</div>
           </div>
         )}
