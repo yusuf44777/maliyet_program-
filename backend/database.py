@@ -103,6 +103,40 @@ def close_pg_pool():
         pool.closeall()
 
 
+def _acquire_healthy_pooled_conn(pool):
+    """
+    Havuzdan bağlantı alırken stale/broken bağlantıyı eleyip yeniden dener.
+    """
+    last_error = None
+    for _ in range(2):
+        raw_conn = pool.getconn()
+        try:
+            cur = raw_conn.cursor()
+            try:
+                cur.execute("SELECT 1")
+                _ = cur.fetchone()
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            return raw_conn
+        except Exception as exc:
+            last_error = exc
+            try:
+                pool.putconn(raw_conn, close=True)
+            except TypeError:
+                try:
+                    raw_conn.close()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+    if last_error:
+        raise last_error
+    raise RuntimeError("PostgreSQL connection pool: sağlıklı bağlantı alınamadı")
+
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent  # maliyet_programı root
 KATEGORI_ROOT = PROJECT_ROOT.parent  # kategori_calismasi root
 
@@ -258,11 +292,27 @@ class PGCompatConnection:
             return None
         if self._pool is not None:
             # Broken transaction state'in pool'a geri dönmesini engelle.
+            broken = False
             try:
                 self._inner.rollback()
             except Exception:
-                pass
-            self._pool.putconn(self._inner)
+                broken = True
+            try:
+                self._pool.putconn(self._inner, close=broken)
+            except TypeError:
+                if broken:
+                    try:
+                        self._inner.close()
+                    except Exception:
+                        pass
+                else:
+                    self._pool.putconn(self._inner)
+            except Exception:
+                if broken:
+                    try:
+                        self._inner.close()
+                    except Exception:
+                        pass
         else:
             self._inner.close()
         self._is_closed = True
@@ -365,7 +415,7 @@ def get_db():
             raise RuntimeError("PostgreSQL için 'psycopg2-binary' veya 'psycopg' kurulmalı.")
         pool = _get_or_create_pg_pool()
         if pool is not None:
-            raw_conn = pool.getconn()
+            raw_conn = _acquire_healthy_pooled_conn(pool)
             try:
                 raw_conn.autocommit = False
             except Exception:
@@ -436,6 +486,85 @@ def ensure_products_columns(cursor):
     for col_name, col_type in PRODUCT_EXTRA_COLUMNS:
         if col_name not in existing:
             cursor.execute(f"ALTER TABLE products ADD COLUMN {col_name} {col_type}")
+
+
+def ensure_audit_logs_columns(cursor):
+    """audit_logs tablosuna izlenebilirlik kolonlarını migrasyonla ekler."""
+    columns = [
+        ("request_id", "TEXT"),
+        ("method", "TEXT"),
+        ("path", "TEXT"),
+        ("ip_address", "TEXT"),
+        ("user_agent", "TEXT"),
+        ("status", "TEXT"),
+    ]
+    if IS_POSTGRES:
+        for col_name, col_type in columns:
+            cursor.execute(f"ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS {col_name} {col_type}")
+        return
+
+    cols = cursor.execute("PRAGMA table_info(audit_logs)").fetchall()
+    existing = {str(c[1]) for c in cols}
+    for col_name, col_type in columns:
+        if col_name not in existing:
+            cursor.execute(f"ALTER TABLE audit_logs ADD COLUMN {col_name} {col_type}")
+
+
+def ensure_approval_requests_columns(cursor, ref_id_type: str):
+    """approval_requests tablosuna workflow kolonlarini migrasyonla ekler."""
+    columns = [
+        ("request_type", "TEXT"),
+        ("target", "TEXT"),
+        ("payload", "TEXT"),
+        ("status", "TEXT"),
+        ("requested_by", ref_id_type),
+        ("requested_username", "TEXT"),
+        ("reviewed_by", ref_id_type),
+        ("reviewed_username", "TEXT"),
+        ("review_note", "TEXT"),
+        ("execution_result", "TEXT"),
+        ("created_at", "TIMESTAMP"),
+        ("reviewed_at", "TIMESTAMP"),
+        ("executed_at", "TIMESTAMP"),
+    ]
+    if IS_POSTGRES:
+        for col_name, col_type in columns:
+            cursor.execute(f"ALTER TABLE approval_requests ADD COLUMN IF NOT EXISTS {col_name} {col_type}")
+        return
+
+    cols = cursor.execute("PRAGMA table_info(approval_requests)").fetchall()
+    existing = {str(c[1]) for c in cols}
+    for col_name, col_type in columns:
+        if col_name not in existing:
+            cursor.execute(f"ALTER TABLE approval_requests ADD COLUMN {col_name} {col_type}")
+
+
+def ensure_indexes(cursor):
+    """Sık erişilen sorgular için index'leri oluşturur."""
+    index_sql = [
+        "CREATE INDEX IF NOT EXISTS idx_products_kategori ON products(kategori)",
+        "CREATE INDEX IF NOT EXISTS idx_products_parent_name ON products(parent_name)",
+        "CREATE INDEX IF NOT EXISTS idx_products_parent_kategori ON products(parent_name, kategori)",
+        "CREATE INDEX IF NOT EXISTS idx_products_identifier ON products(product_identifier)",
+        "CREATE INDEX IF NOT EXISTS idx_products_variation_size ON products(variation_size)",
+        "CREATE INDEX IF NOT EXISTS idx_product_materials_child_sku ON product_materials(child_sku)",
+        "CREATE INDEX IF NOT EXISTS idx_product_materials_material_id ON product_materials(material_id)",
+        "CREATE INDEX IF NOT EXISTS idx_product_costs_child_sku ON product_costs(child_sku)",
+        "CREATE INDEX IF NOT EXISTS idx_product_costs_cost_name ON product_costs(cost_name)",
+        "CREATE INDEX IF NOT EXISTS idx_product_costs_assigned ON product_costs(assigned)",
+        "CREATE INDEX IF NOT EXISTS idx_cost_definitions_category_active ON cost_definitions(category, is_active)",
+        "CREATE INDEX IF NOT EXISTS idx_cost_definitions_kargo_code ON cost_definitions(kargo_code)",
+        "CREATE INDEX IF NOT EXISTS idx_users_role_active ON users(role, is_active)",
+        "CREATE INDEX IF NOT EXISTS idx_users_username_lower ON users(LOWER(username))",
+        "CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_logs_request_id ON audit_logs(request_id)",
+        "CREATE INDEX IF NOT EXISTS idx_approval_requests_status_created_at ON approval_requests(status, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_approval_requests_requested_by ON approval_requests(requested_by)",
+        "CREATE INDEX IF NOT EXISTS idx_approval_requests_type_status ON approval_requests(request_type, status)",
+    ]
+    for sql in index_sql:
+        cursor.execute(sql)
 
 
 def init_db():
@@ -548,9 +677,40 @@ def init_db():
             action TEXT NOT NULL,
             target TEXT,
             details TEXT,
+            request_id TEXT,
+            method TEXT,
+            path TEXT,
+            ip_address TEXT,
+            user_agent TEXT,
+            status TEXT DEFAULT 'ok',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    ensure_audit_logs_columns(cursor)
+
+    # Onay workflow kayıtları
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS approval_requests (
+            id {id_col},
+            request_type TEXT NOT NULL,
+            target TEXT,
+            payload TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            requested_by {ref_id_type},
+            requested_username TEXT,
+            reviewed_by {ref_id_type},
+            reviewed_username TEXT,
+            review_note TEXT,
+            execution_result TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            reviewed_at TIMESTAMP,
+            executed_at TIMESTAMP
+        )
+    """)
+    ensure_approval_requests_columns(cursor, ref_id_type=ref_id_type)
+
+    # Sorgu performansı için index paketini uygula
+    ensure_indexes(cursor)
 
     conn.commit()
     conn.close()

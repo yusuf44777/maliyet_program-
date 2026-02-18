@@ -62,7 +62,12 @@ Temel alanlar:
 - `CORS_ORIGINS=https://app.example.com`
 - `ENABLE_RELOAD_DB=false`
 - `ENABLE_PRODUCT_SYNC=true` (kategori bazli parent-child guncelleme endpointi)
+- `ENABLE_APPROVAL_WORKFLOW=false` (inherit islemlerini onaya dusurur)
 - `SEED_DEFAULT_USERS=false`
+- `PG_POOL_ENABLED=true`
+- `PG_POOL_MIN_CONN=1`
+- `PG_POOL_MAX_CONN=3`
+- `PG_CONNECT_TIMEOUT=10`
 - `TEMPLATE_PATH` / `TEMPLATE_URL`
 - `KARGO_CSV_PATH` / `KARGO_CSV_URL`
 - `KATEGORI_METAL_CSV_PATH`, `KATEGORI_AHSAP_CSV_PATH`, `KATEGORI_CAM_CSV_PATH`, `KATEGORI_HARITA_CSV_PATH`, `KATEGORI_MOBILYA_CSV_PATH` (opsiyonel CSV override)
@@ -107,6 +112,44 @@ curl -X POST "$API_BASE/api/sync-products" \
 - `categories` bos birakilirsa tum desteklenen kategoriler senkronize edilir.
 - `replace_existing=true` secili kategorilerin eski urunlerini silip CSV'den yeniden yukler.
 - `mobilya` kategorisi desteklenir.
+
+## DB Performance Paketi
+
+Backend tarafinda su iyilestirmeler aktif:
+- PostgreSQL connection pooling (`psycopg2.pool.ThreadedConnectionPool`)
+- stale/broken pooled connection eleme ve tekrar baglanma
+- sik sorgular icin index paketi:
+  - `products(kategori, parent_name, product_identifier, variation_size)`
+  - `product_materials(child_sku, material_id)`
+  - `product_costs(child_sku, cost_name, assigned)`
+  - `cost_definitions(category, is_active, kargo_code)`
+  - `audit_logs(created_at, action, request_id)`
+  - `approval_requests(status, created_at, request_type, requested_by)`
+
+## Kalite Guvencesi (QA)
+
+`GET /api/quality/report` (admin) endpointi su kontrolleri doner:
+- orphan `product_materials`
+- orphan `product_costs`
+- tanimsiz/inactive `cost_definition` ile assigned maliyetler
+- parent/identifier/variation_size eksik urunler
+- case-insensitive duplicate user ve cost name kontrolleri
+
+## Audit + Izlenebilirlik
+
+`audit_logs` artik su alanlari da kaydeder:
+- `request_id`, `method`, `path`, `ip_address`, `user_agent`, `status`
+
+Request bazli `x-request-id` response header'i set edilir.  
+Admin audit listesi: `GET /api/auth/audit-logs`.
+
+## Onay Workflow
+
+`ENABLE_APPROVAL_WORKFLOW=true` oldugunda:
+- admin disi kullanicinin `POST /api/inherit` istegi direkt uygulanmaz, `pending_approval` olarak kaydedilir.
+- admin `GET /api/approvals` ile bekleyenleri listeler.
+- admin `POST /api/approvals/{approval_id}/review` ile `approve/reject` verir.
+- ayni payload, approved `approval_id` ile tekrar gonderildiginde inheritance execute edilir ve `executed_at/execution_result` yazilir.
 
 ## Production Notlari
 

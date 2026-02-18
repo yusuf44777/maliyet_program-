@@ -100,11 +100,17 @@ class ParentInheritanceRequest(BaseModel):
     materials: dict[int, float]  # { material_id: quantity }
     sac_material_id: Optional[int] = None  # Seçilen Saç kalınlığı (id), miktar = Alan
     mdf_material_id: Optional[int] = None  # Seçilen MDF (id), miktar = Alan
+    approval_id: Optional[int] = None  # Onay workflow aktifken approved isteği execute etmek için
 
 
 class ProductSyncRequest(BaseModel):
     categories: list[str] = Field(default_factory=list)  # boş ise tüm kategoriler
     replace_existing: bool = True  # true ise seçili kategorilerdeki ürünleri yeniden oluşturur
+
+
+class ApprovalReviewRequest(BaseModel):
+    approve: bool = True
+    review_note: Optional[str] = None
 
 
 class AuthLoginRequest(BaseModel):

@@ -14,6 +14,8 @@ import re
 import time
 import json
 import math
+import uuid
+import contextvars
 import base64
 import hmac
 import hashlib
@@ -39,7 +41,7 @@ from models import (
     ProductResponse, RawMaterialResponse, RawMaterialUpdate, RawMaterialCreate,
     ProductMaterialEntry, ProductMaterialBulk, ProductCostAssignment,
     ExportRequest, StatsResponse, ParentInheritanceRequest,
-    ProductSyncRequest,
+    ProductSyncRequest, ApprovalReviewRequest,
     CostDefinitionCreate, CostDefinitionUpdate,
     AuthLoginRequest, AuthChangePasswordRequest, AuthUserCreate, AuthUserUpdate,
 )
@@ -50,6 +52,11 @@ app = FastAPI(
     title="Maliyet Sistemi API",
     description="ERP Maliyet Şablonu Yönetim Sistemi",
     version="1.0.0",
+)
+
+REQUEST_AUDIT_CONTEXT: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "request_audit_context",
+    default={},
 )
 
 
@@ -80,6 +87,7 @@ def parse_cors_origins() -> list[str]:
 ALLOWED_CORS_ORIGINS = parse_cors_origins()
 ENABLE_RELOAD_DB = env_flag("ENABLE_RELOAD_DB", default=not IS_PRODUCTION)
 ENABLE_PRODUCT_SYNC = env_flag("ENABLE_PRODUCT_SYNC", default=True)
+ENABLE_APPROVAL_WORKFLOW = env_flag("ENABLE_APPROVAL_WORKFLOW", default=False)
 SEED_DEFAULT_USERS = env_flag("SEED_DEFAULT_USERS", default=True)
 ENABLE_STARTUP_DATA_BOOTSTRAP = env_flag("ENABLE_STARTUP_DATA_BOOTSTRAP", default=not IS_PRODUCTION)
 ENABLE_STARTUP_TEMPLATE_SYNC = env_flag("ENABLE_STARTUP_TEMPLATE_SYNC", default=not IS_PRODUCTION)
@@ -135,6 +143,9 @@ ADMIN_ONLY_RULES: list[tuple[str, str]] = [
     ("DELETE", "/api/cost-definitions/"),
     ("POST", "/api/reload-db"),
     ("POST", "/api/sync-products"),
+    ("GET", "/api/quality/report"),
+    ("GET", "/api/approvals"),
+    ("POST", "/api/approvals/"),
     ("GET", "/api/auth/users"),
     ("POST", "/api/auth/users"),
     ("PUT", "/api/auth/users/"),
@@ -383,13 +394,23 @@ def get_user_by_id(user_id: int):
         conn.close()
 
 
-def write_audit_log(user: dict | None, action: str, target: str | None = None, details: dict | None = None):
+def write_audit_log(
+    user: dict | None,
+    action: str,
+    target: str | None = None,
+    details: dict | None = None,
+    status: str = "ok",
+):
     try:
+        ctx = REQUEST_AUDIT_CONTEXT.get({})
         conn = get_db()
         conn.execute(
             """
-            INSERT INTO audit_logs (user_id, username, action, target, details)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO audit_logs (
+                user_id, username, action, target, details,
+                request_id, method, path, ip_address, user_agent, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user.get("id") if user else None,
@@ -397,6 +418,12 @@ def write_audit_log(user: dict | None, action: str, target: str | None = None, d
                 action,
                 target,
                 json.dumps(details or {}, ensure_ascii=False),
+                ctx.get("request_id"),
+                ctx.get("method"),
+                ctx.get("path"),
+                ctx.get("ip_address"),
+                ctx.get("user_agent"),
+                str(status or "ok"),
             ),
         )
         conn.commit()
@@ -484,6 +511,62 @@ def require_admin_user(request: Request) -> dict:
     if user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Bu işlem için admin yetkisi gerekli")
     return user
+
+
+def create_approval_request(request_type: str, target: str | None, payload: dict, user: dict | None) -> int:
+    conn = get_db()
+    if DB_BACKEND == "postgres":
+        row = conn.execute(
+            """
+            INSERT INTO approval_requests (request_type, target, payload, status, requested_by, requested_username)
+            VALUES (?, ?, ?, 'pending', ?, ?)
+            RETURNING id
+            """,
+            (
+                str(request_type or "").strip(),
+                target,
+                json.dumps(payload or {}, ensure_ascii=False),
+                user.get("id") if user else None,
+                user.get("username") if user else None,
+            ),
+        ).fetchone()
+        approval_id = row_first_value(row)
+    else:
+        cur = conn.execute(
+            """
+            INSERT INTO approval_requests (request_type, target, payload, status, requested_by, requested_username)
+            VALUES (?, ?, ?, 'pending', ?, ?)
+            """,
+            (
+                str(request_type or "").strip(),
+                target,
+                json.dumps(payload or {}, ensure_ascii=False),
+                user.get("id") if user else None,
+                user.get("username") if user else None,
+            ),
+        )
+        approval_id = getattr(cur, "lastrowid", None)
+    conn.commit()
+    conn.close()
+    return int(approval_id)
+
+
+def parse_json_text(value):
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(str(value))
+    except Exception:
+        return value
+
+
+def format_approval_row(row):
+    item = dict(row)
+    item["payload"] = parse_json_text(item.get("payload"))
+    item["execution_result"] = parse_json_text(item.get("execution_result"))
+    return item
 
 
 def merge_product_cost_name(conn, old_name: str, new_name: str):
@@ -610,6 +693,35 @@ def calculate_kargo_desi(
     if hacim_desi is None:
         return ceil_to_half(float(agirlik))
     return ceil_to_half(float(max(hacim_desi, agirlik)))
+
+
+def resolve_request_ip(request: Request) -> str | None:
+    forwarded = request.headers.get("x-forwarded-for", "").strip()
+    if forwarded:
+        return forwarded.split(",")[0].strip() or None
+    if request.client and request.client.host:
+        return request.client.host
+    return None
+
+
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    request_id = (request.headers.get("x-request-id", "").strip() or uuid.uuid4().hex)
+    context = {
+        "request_id": request_id,
+        "method": request.method,
+        "path": request.url.path,
+        "ip_address": resolve_request_ip(request),
+        "user_agent": request.headers.get("user-agent"),
+    }
+    request.state.request_id = request_id
+    token = REQUEST_AUDIT_CONTEXT.set(context)
+    try:
+        response = await call_next(request)
+    finally:
+        REQUEST_AUDIT_CONTEXT.reset(token)
+    response.headers["x-request-id"] = request_id
+    return response
 
 
 @app.middleware("http")
@@ -742,6 +854,7 @@ def health_check():
         "has_database_url": bool(DATABASE_URL),
         "seed_default_users": SEED_DEFAULT_USERS,
         "enable_product_sync": ENABLE_PRODUCT_SYNC,
+        "enable_approval_workflow": ENABLE_APPROVAL_WORKFLOW,
         "supported_categories": get_supported_categories(),
         "cors_origins": ALLOWED_CORS_ORIGINS,
     }
@@ -967,7 +1080,8 @@ def list_audit_logs(request: Request, limit: int = Query(200, ge=1, le=1000)):
     conn = get_db()
     rows = conn.execute(
         """
-        SELECT id, user_id, username, action, target, details, created_at
+        SELECT id, user_id, username, action, target, details,
+               request_id, method, path, ip_address, user_agent, status, created_at
         FROM audit_logs
         ORDER BY id DESC
         LIMIT ?
@@ -987,6 +1101,189 @@ def list_audit_logs(request: Request, limit: int = Query(200, ge=1, le=1000)):
                 pass
         out.append(item)
     return out
+
+
+@app.get("/api/approvals")
+def list_approvals(
+    request: Request,
+    status: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    require_admin_user(request)
+    where_sql = ""
+    params: list = []
+    if status:
+        where_sql = "WHERE status = ?"
+        params.append(str(status).strip().lower())
+    params.append(limit)
+
+    conn = get_db()
+    rows = conn.execute(
+        f"""
+        SELECT id, request_type, target, payload, status,
+               requested_by, requested_username, reviewed_by, reviewed_username,
+               review_note, execution_result, created_at, reviewed_at, executed_at
+        FROM approval_requests
+        {where_sql}
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    conn.close()
+    return [format_approval_row(row) for row in rows]
+
+
+@app.post("/api/approvals/{approval_id}/review")
+def review_approval(
+    approval_id: int,
+    data: ApprovalReviewRequest,
+    request: Request,
+):
+    admin = require_admin_user(request)
+    conn = get_db()
+    row = conn.execute(
+        """
+        SELECT id, request_type, target, status, payload
+        FROM approval_requests
+        WHERE id = ?
+        """,
+        (approval_id,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Onay kaydı bulunamadı")
+    if str(row["status"]).lower() != "pending":
+        conn.close()
+        raise HTTPException(status_code=409, detail="Bu kayıt bekleyen onay durumunda değil")
+
+    new_status = "approved" if bool(data.approve) else "rejected"
+    conn.execute(
+        """
+        UPDATE approval_requests
+        SET status = ?,
+            reviewed_by = ?,
+            reviewed_username = ?,
+            review_note = ?,
+            reviewed_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            new_status,
+            admin["id"],
+            admin["username"],
+            (data.review_note or "").strip() or None,
+            approval_id,
+        ),
+    )
+    conn.commit()
+    updated = conn.execute(
+        """
+        SELECT id, request_type, target, payload, status,
+               requested_by, requested_username, reviewed_by, reviewed_username,
+               review_note, execution_result, created_at, reviewed_at, executed_at
+        FROM approval_requests
+        WHERE id = ?
+        """,
+        (approval_id,),
+    ).fetchone()
+    conn.close()
+
+    write_audit_log(
+        admin,
+        f"approval.{new_status}",
+        target=str(approval_id),
+        details={
+            "approval_id": approval_id,
+            "request_type": row["request_type"],
+            "target": row["target"],
+        },
+    )
+    return format_approval_row(updated)
+
+
+# ─────────────────────────── QUALITY ───────────────────────────
+
+@app.get("/api/quality/report")
+def quality_report(request: Request):
+    """
+    Veri kalite güvencesi için temel bütünlük kontrollerini raporlar.
+    """
+    require_admin_user(request)
+    conn = get_db()
+    checks = {
+        "orphan_product_materials": row_first_value(conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM product_materials pm
+            LEFT JOIN products p ON p.child_sku = pm.child_sku
+            WHERE p.child_sku IS NULL
+            """
+        ).fetchone()) or 0,
+        "orphan_product_costs": row_first_value(conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM product_costs pc
+            LEFT JOIN products p ON p.child_sku = pc.child_sku
+            WHERE p.child_sku IS NULL
+            """
+        ).fetchone()) or 0,
+        "assigned_costs_without_definition": row_first_value(conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM product_costs pc
+            LEFT JOIN cost_definitions cd ON cd.name = pc.cost_name
+            WHERE pc.assigned = 1 AND cd.id IS NULL
+            """
+        ).fetchone()) or 0,
+        "assigned_costs_inactive_definition": row_first_value(conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM product_costs pc
+            JOIN cost_definitions cd ON cd.name = pc.cost_name
+            WHERE pc.assigned = 1 AND COALESCE(cd.is_active, 1) = 0
+            """
+        ).fetchone()) or 0,
+        "products_missing_parent_name": row_first_value(conn.execute(
+            "SELECT COUNT(*) FROM products WHERE parent_name IS NULL OR TRIM(parent_name) = ''"
+        ).fetchone()) or 0,
+        "products_missing_identifier": row_first_value(conn.execute(
+            "SELECT COUNT(*) FROM products WHERE product_identifier IS NULL OR TRIM(product_identifier) = ''"
+        ).fetchone()) or 0,
+        "products_missing_variation_size": row_first_value(conn.execute(
+            "SELECT COUNT(*) FROM products WHERE variation_size IS NULL OR TRIM(variation_size) = ''"
+        ).fetchone()) or 0,
+        "duplicate_users_case_insensitive": row_first_value(conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT LOWER(username) AS k, COUNT(*) AS c
+                FROM users
+                GROUP BY LOWER(username)
+                HAVING COUNT(*) > 1
+            ) t
+            """
+        ).fetchone()) or 0,
+        "duplicate_cost_names_case_insensitive": row_first_value(conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT LOWER(name) AS k, COUNT(*) AS c
+                FROM cost_definitions
+                GROUP BY LOWER(name)
+                HAVING COUNT(*) > 1
+            ) t
+            """
+        ).fetchone()) or 0,
+    }
+    conn.close()
+
+    issue_count = sum(int(v or 0) for v in checks.values())
+    return {
+        "status": "ok" if issue_count == 0 else "warning",
+        "issue_count": issue_count,
+        "checks": checks,
+    }
 
 
 # ─────────────────────────── STATS ───────────────────────────
@@ -1949,6 +2246,60 @@ def apply_parent_inheritance(req: ParentInheritanceRequest, request: Request):
        - Boya + İşçilik = child.alan_m2 * 5
     """
     user = require_request_user(request)
+    approval_id = req.approval_id
+    approval_context = req.model_dump(mode="json", exclude={"approval_id"})
+
+    if ENABLE_APPROVAL_WORKFLOW and user.get("role") != "admin":
+        if not approval_id:
+            created_approval_id = create_approval_request(
+                "inherit.apply",
+                req.parent_name,
+                approval_context,
+                user,
+            )
+            write_audit_log(
+                user,
+                "approval.requested",
+                target=req.parent_name,
+                details={
+                    "approval_id": created_approval_id,
+                    "request_type": "inherit.apply",
+                    "parent_name": req.parent_name,
+                },
+                status="pending",
+            )
+            return {
+                "status": "pending_approval",
+                "approval_id": created_approval_id,
+                "parent_name": req.parent_name,
+                "message": "İşlem onaya gönderildi. Admin onayından sonra approval_id ile tekrar çalıştırın.",
+            }
+
+        approval_conn = get_db()
+        try:
+            approval_row = approval_conn.execute(
+                """
+                SELECT id, request_type, status, payload, requested_by
+                FROM approval_requests
+                WHERE id = ?
+                """,
+                (approval_id,),
+            ).fetchone()
+        finally:
+            approval_conn.close()
+        if not approval_row:
+            raise HTTPException(status_code=404, detail="Onay kaydı bulunamadı")
+        if str(approval_row["request_type"] or "").strip() != "inherit.apply":
+            raise HTTPException(status_code=400, detail="approval_id bu işlem tipiyle uyumlu değil")
+        if str(approval_row["status"] or "").strip().lower() != "approved":
+            raise HTTPException(status_code=409, detail="İşlem henüz onaylanmamış")
+        if approval_row["requested_by"] and int(approval_row["requested_by"]) != int(user["id"]):
+            raise HTTPException(status_code=403, detail="Bu onay kaydı başka kullanıcıya ait")
+
+        approved_payload = parse_json_text(approval_row["payload"]) or {}
+        if approved_payload != approval_context:
+            raise HTTPException(status_code=400, detail="Onay sonrası payload değişmiş. Yeniden onay isteği açın.")
+
     conn = get_db()
     kargo_lookup = load_kargo_lookup()
 
@@ -2220,8 +2571,36 @@ def apply_parent_inheritance(req: ParentInheritanceRequest, request: Request):
             "size_kaplama_map_count": len(req.kaplama_map or {}),
             "name_kaplama_map_count": len(req.kaplama_name_map or {}),
             "weight_map_count": len(req.weight_map or {}),
+            "approval_id": approval_id,
         },
     )
+
+    if approval_id:
+        try:
+            conn2 = get_db()
+            conn2.execute(
+                """
+                UPDATE approval_requests
+                SET executed_at = CURRENT_TIMESTAMP,
+                    execution_result = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(
+                        {
+                            "children_updated": len(updated_children),
+                            "children_skipped": len(skipped_children),
+                            "parent_name": req.parent_name,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    approval_id,
+                ),
+            )
+            conn2.commit()
+            conn2.close()
+        except Exception:
+            pass
 
     return {
         "status": "ok",
