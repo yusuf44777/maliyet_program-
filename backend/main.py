@@ -31,6 +31,7 @@ from database import (
     sync_cost_definitions_from_template, list_cost_definitions,
     canonicalize_kaplama_cost_name, normalize_legacy_gold_silver_names,
     deactivate_shadowed_kaplama_base_names,
+    DB_BACKEND, DATABASE_URL,
     IntegrityError as DBIntegrityError,
 )
 from models import (
