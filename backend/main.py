@@ -1097,20 +1097,31 @@ def list_product_groups(kategori: Optional[str] = None):
     Aynı parent (maliyet şablonu satırı) altındaki ürünler aynı hammadde yapısını paylaşır.
     """
     conn = get_db()
-    where = f"WHERE kategori = '{kategori}'" if kategori else ""
+    where_sql = ""
+    params = []
+    if kategori:
+        where_sql = "WHERE kategori = ?"
+        params.append(kategori)
+
+    identifier_agg_sql = (
+        "STRING_AGG(DISTINCT product_identifier, ',')"
+        if DB_BACKEND == "postgres"
+        else "GROUP_CONCAT(DISTINCT product_identifier)"
+    )
+
     rows = conn.execute(f"""
         SELECT parent_name, kategori,
                COUNT(*) as variant_count,
                COUNT(DISTINCT product_identifier) as sub_group_count,
-               GROUP_CONCAT(DISTINCT product_identifier) as product_identifiers,
+               {identifier_agg_sql} as product_identifiers,
                MIN(en) as min_en, MAX(en) as max_en,
                MIN(boy) as min_boy, MAX(boy) as max_boy,
                MIN(alan_m2) as min_alan, MAX(alan_m2) as max_alan
         FROM products
-        {where}
+        {where_sql}
         GROUP BY parent_name, kategori
         ORDER BY kategori, parent_name
-    """).fetchall()
+    """, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
