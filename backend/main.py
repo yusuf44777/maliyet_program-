@@ -78,6 +78,8 @@ def parse_cors_origins() -> list[str]:
 ALLOWED_CORS_ORIGINS = parse_cors_origins()
 ENABLE_RELOAD_DB = env_flag("ENABLE_RELOAD_DB", default=not IS_PRODUCTION)
 SEED_DEFAULT_USERS = env_flag("SEED_DEFAULT_USERS", default=True)
+ENABLE_STARTUP_DATA_BOOTSTRAP = env_flag("ENABLE_STARTUP_DATA_BOOTSTRAP", default=not IS_PRODUCTION)
+ENABLE_STARTUP_TEMPLATE_SYNC = env_flag("ENABLE_STARTUP_TEMPLATE_SYNC", default=not IS_PRODUCTION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -659,9 +661,13 @@ def _do_startup():
         ensure_default_users()
         logger.info("[startup] ensure_default_users tamamlandı")
         conn = get_db()
-        count = row_first_value(conn.execute("SELECT COUNT(*) FROM products").fetchone()) or 0
-        if count == 0:
+        try:
+            count = row_first_value(conn.execute("SELECT COUNT(*) FROM products").fetchone()) or 0
+        finally:
             conn.close()
+
+        if count == 0 and ENABLE_STARTUP_DATA_BOOTSTRAP:
+            logger.info("[startup] products boş, bootstrap yükleme başlıyor...")
             try:
                 load_mapped_products()
             except Exception as e:
@@ -671,26 +677,34 @@ def _do_startup():
             except Exception as e:
                 logger.warning(f"[startup] load_default_materials başarısız: {e}")
             conn = get_db()
-        # Her zaman: "Boya" (lt) hammaddesini kaldır (sadece "Boya + İşçilik" kalacak)
-        try:
-            conn.execute("DELETE FROM raw_materials WHERE name = 'Boya' AND unit = 'lt'")
-            conn.commit()
-        except Exception:
-            pass
-        conn.close()
-        # Template'deki maliyet başlıklarını yönetilebilir tabloya senkronize et
-        try:
-            sync_cost_definitions_from_template()
-        except Exception as e:
-            logger.warning(f"[startup] sync_cost_definitions başarısız: {e}")
-        try:
-            normalize_legacy_gold_silver_names()
-        except Exception as e:
-            logger.warning(f"[startup] normalize_legacy_gold_silver başarısız: {e}")
-        try:
-            deactivate_shadowed_kaplama_base_names()
-        except Exception as e:
-            logger.warning(f"[startup] deactivate_shadowed başarısız: {e}")
+            try:
+                # Her zaman: "Boya" (lt) hammaddesini kaldır (sadece "Boya + İşçilik" kalacak)
+                try:
+                    conn.execute("DELETE FROM raw_materials WHERE name = 'Boya' AND unit = 'lt'")
+                    conn.commit()
+                except Exception:
+                    pass
+            finally:
+                conn.close()
+        elif count == 0:
+            logger.info("[startup] products boş ama bootstrap devre dışı (ENABLE_STARTUP_DATA_BOOTSTRAP=false)")
+
+        if ENABLE_STARTUP_TEMPLATE_SYNC:
+            # Template'deki maliyet başlıklarını yönetilebilir tabloya senkronize et
+            try:
+                sync_cost_definitions_from_template()
+            except Exception as e:
+                logger.warning(f"[startup] sync_cost_definitions başarısız: {e}")
+            try:
+                normalize_legacy_gold_silver_names()
+            except Exception as e:
+                logger.warning(f"[startup] normalize_legacy_gold_silver başarısız: {e}")
+            try:
+                deactivate_shadowed_kaplama_base_names()
+            except Exception as e:
+                logger.warning(f"[startup] deactivate_shadowed başarısız: {e}")
+        else:
+            logger.info("[startup] template sync devre dışı (ENABLE_STARTUP_TEMPLATE_SYNC=false)")
         _startup_done = True
         _startup_error = None
         logger.info("[startup] tamamlandı")
