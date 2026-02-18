@@ -1660,8 +1660,9 @@ def get_kaplama_name_suggestions(parent_name: str):
 
 
 @app.post("/api/product-costs")
-def set_product_cost(entry: ProductCostAssignment):
+def set_product_cost(entry: ProductCostAssignment, request: Request):
     """Bir ürüne maliyet (ambalaj) atar."""
+    user = require_request_user(request)
     conn = get_db()
     conn.execute("""
         INSERT INTO product_costs (child_sku, cost_name, assigned)
@@ -1670,13 +1671,23 @@ def set_product_cost(entry: ProductCostAssignment):
     """, (entry.child_sku, entry.cost_name, int(entry.assigned), int(entry.assigned)))
     conn.commit()
     conn.close()
+    write_audit_log(
+        user,
+        "costs.assign",
+        target=entry.child_sku,
+        details={
+            "child_sku": entry.child_sku,
+            "cost_name": entry.cost_name,
+            "assigned": bool(entry.assigned),
+        },
+    )
     return {"status": "ok"}
 
 
 # ─────────────────────── PARENT-TO-CHILD INHERITANCE ───────────────────────
 
 @app.post("/api/inherit")
-def apply_parent_inheritance(req: ParentInheritanceRequest):
+def apply_parent_inheritance(req: ParentInheritanceRequest, request: Request):
     """
     Parent-to-Child Cost Inheritance:
     1. Copy base raw material values to every child of the parent.
@@ -1690,6 +1701,7 @@ def apply_parent_inheritance(req: ParentInheritanceRequest):
        - Strafor  = child.alan_m2 * 1.2
        - Boya + İşçilik = child.alan_m2 * 5
     """
+    user = require_request_user(request)
     conn = get_db()
     kargo_lookup = load_kargo_lookup()
 
@@ -1948,6 +1960,21 @@ def apply_parent_inheritance(req: ParentInheritanceRequest):
 
     conn.commit()
     conn.close()
+    write_audit_log(
+        user,
+        "inherit.apply",
+        target=req.parent_name,
+        details={
+            "parent_name": req.parent_name,
+            "children_updated": len(updated_children),
+            "children_skipped": len(skipped_children),
+            "materials_count": len(req.materials or {}),
+            "size_cost_map_count": len(req.cost_map or {}),
+            "size_kaplama_map_count": len(req.kaplama_map or {}),
+            "name_kaplama_map_count": len(req.kaplama_name_map or {}),
+            "weight_map_count": len(req.weight_map or {}),
+        },
+    )
 
     return {
         "status": "ok",
@@ -1965,14 +1992,15 @@ def apply_parent_inheritance(req: ParentInheritanceRequest):
 # ─────────────────────────── EXPORT ───────────────────────────
 
 @app.post("/api/export")
-def export_excel(request: ExportRequest):
+def export_excel(payload: ExportRequest, request: Request):
     """
     Seçilen ürünleri maliyet_sablonu formatında Excel'e export eder.
     """
+    user = require_request_user(request)
     conn = get_db()
 
     products_data = []
-    for sku in request.child_skus:
+    for sku in payload.child_skus:
         product = conn.execute("SELECT * FROM products WHERE child_sku = ?", (sku,)).fetchone()
         if not product:
             continue
@@ -1990,7 +2018,7 @@ def export_excel(request: ExportRequest):
         }
 
         # Hammaddeler
-        if request.include_materials:
+        if payload.include_materials:
             materials = conn.execute("""
                 SELECT rm.name, pm.quantity
                 FROM product_materials pm
@@ -2000,7 +2028,7 @@ def export_excel(request: ExportRequest):
             export_item["materials"] = {m["name"]: m["quantity"] for m in materials}
 
         # Maliyetler
-        if request.include_costs:
+        if payload.include_costs:
             costs = conn.execute(
                 "SELECT cost_name FROM product_costs WHERE child_sku = ? AND assigned = 1",
                 (sku,)
@@ -2015,6 +2043,17 @@ def export_excel(request: ExportRequest):
         raise HTTPException(status_code=400, detail="Export edilecek ürün bulunamadı")
 
     output_path = export_to_template(products_data)
+    write_audit_log(
+        user,
+        "export.run",
+        target=f"{len(products_data)} ürün",
+        details={
+            "requested_skus": len(payload.child_skus),
+            "exported_skus": len(products_data),
+            "include_materials": bool(payload.include_materials),
+            "include_costs": bool(payload.include_costs),
+        },
+    )
     return FileResponse(
         output_path,
         filename=os.path.basename(output_path),
@@ -2023,14 +2062,14 @@ def export_excel(request: ExportRequest):
 
 
 @app.get("/api/export/all")
-def export_all():
+def export_all(request: Request):
     """Tüm ürünleri export eder."""
     conn = get_db()
     all_rows = conn.execute("SELECT child_sku FROM products ORDER BY child_sku").fetchall()
     all_skus = [r.get("child_sku") if isinstance(r, dict) else r["child_sku"] for r in all_rows]
     conn.close()
 
-    return export_excel(ExportRequest(child_skus=all_skus))
+    return export_excel(ExportRequest(child_skus=all_skus), request)
 
 
 # ─────────────────────────── TEMPLATE INFO ───────────────────────────

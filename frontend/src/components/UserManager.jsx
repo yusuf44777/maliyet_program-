@@ -98,6 +98,33 @@ export default function UserManager({ currentUser }) {
     }
   };
 
+  const formatAuditDetails = (details) => {
+    if (!details) return '—';
+    if (typeof details === 'string') return details;
+    if (typeof details !== 'object') return String(details);
+
+    const orderedKeys = [
+      'parent_name',
+      'child_sku',
+      'cost_name',
+      'children_updated',
+      'children_skipped',
+      'requested_skus',
+      'exported_skus',
+      'assigned',
+    ];
+    const picked = orderedKeys
+      .filter((k) => details[k] !== undefined && details[k] !== null)
+      .map((k) => `${k}: ${details[k]}`);
+
+    if (picked.length > 0) return picked.join(' | ');
+
+    return Object.entries(details)
+      .slice(0, 3)
+      .map(([k, v]) => `${k}: ${v}`)
+      .join(' | ') || '—';
+  };
+
   return (
     <div className="space-y-6">
       <div className="bg-white rounded-xl border border-gray-200 p-4 shadow-sm">
@@ -287,6 +314,7 @@ export default function UserManager({ currentUser }) {
                 <th className="w-40">Kullanıcı</th>
                 <th>Aksiyon</th>
                 <th>Hedef</th>
+                <th>Detay</th>
               </tr>
             </thead>
             <tbody>
@@ -296,11 +324,12 @@ export default function UserManager({ currentUser }) {
                   <td className="text-xs">{log.username || '—'}</td>
                   <td className="text-xs font-medium">{log.action}</td>
                   <td className="text-xs">{log.target || '—'}</td>
+                  <td className="text-xs text-gray-500">{formatAuditDetails(log.details)}</td>
                 </tr>
               ))}
               {auditLogs.length === 0 && (
                 <tr>
-                  <td colSpan={4} className="py-6 text-center text-sm text-gray-400">Kayıt yok</td>
+                  <td colSpan={5} className="py-6 text-center text-sm text-gray-400">Kayıt yok</td>
                 </tr>
               )}
             </tbody>
