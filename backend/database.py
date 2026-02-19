@@ -769,10 +769,12 @@ def _resolve_kategori_csv_path(kategori_name: str, kategori_dir: Path) -> Path |
             candidates.append(Path(env_value).expanduser())
 
     candidates.extend([
+        PROJECT_ROOT / f"mapped_products_{kategori_name}.csv",
         PROJECT_ROOT / f"{kategori_name}_kategori_list.csv",
         PROJECT_ROOT / f"{kategori_name}_mapping_result.csv",
         kategori_dir / f"{kategori_name}_kategori_list.csv",
         kategori_dir / "mapped_products.csv",
+        kategori_dir / f"mapped_products_{kategori_name}.csv",
         kategori_dir / f"{kategori_name}_mapping_result.csv",
     ])
 
