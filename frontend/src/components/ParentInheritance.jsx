@@ -114,6 +114,7 @@ export default function ParentInheritance({ onRefresh }) {
   const [selectedGroup, setSelectedGroup] = useState(null);
   const [costMap, setCostMap] = useState({});         // { variation_size: cost_name }
   const [kaplamaMap, setKaplamaMap] = useState({});   // { variation_size: kaplama_cost_name | [kaplama_cost_names] }
+  const [allowMissingKaplama, setAllowMissingKaplama] = useState(false);
   const [weightMap, setWeightMap] = useState({});     // { variation_size: kargo_agirlik }
   const [materialInputs, setMaterialInputs] = useState({}); // { material_id: quantity }
   const [selectedSac, setSelectedSac] = useState(null);     // seçilen Saç material id
@@ -218,6 +219,7 @@ export default function ParentInheritance({ onRefresh }) {
     setMaterialInputs({});
     setSelectedSac(null);
     setSelectedMdf(null);
+    setAllowMissingKaplama(false);
 
     getInheritancePrefill(selectedGroup.parent_name)
       .then((prefill) => {
@@ -379,12 +381,13 @@ export default function ParentInheritance({ onRefresh }) {
 
   // ─── Current step ───
   const allCostsMapped = sizeGroups.length > 0 && sizeGroups.every(sg => costMap[sg.size]);
-  const allKaplamaMapped = nameGroups.length > 0 && nameGroups.every(ng => hasKaplamaSelection(kaplamaNameMap[ng.key]));
+  const allKaplamaMapped = nameGroups.every(ng => hasKaplamaSelection(kaplamaNameMap[ng.key]));
   const allWeightsMapped = sizeGroups.length > 0 && sizeGroups.every(sg => {
     const v = weightMap[sg.size];
     return v !== '' && v !== undefined && v !== null && Number(v) >= 0;
   });
-  const allMappingsReady = allCostsMapped && allKaplamaMapped && allWeightsMapped;
+  const kaplamaRequirementSatisfied = allowMissingKaplama || allKaplamaMapped;
+  const allMappingsReady = allCostsMapped && kaplamaRequirementSatisfied && allWeightsMapped;
   const step = !selectedGroup ? 1 : !allMappingsReady ? 2 : 3;
 
   // ─── Helpers ───
@@ -676,8 +679,24 @@ export default function ParentInheritance({ onRefresh }) {
   }, [selectedGroup, nameGroups, kaplamaSuggestionByName]);
 
   const handleApply = async () => {
-    if (!selectedGroup || !allMappingsReady) {
-      toast.error('Lütfen tüm boyut gruplarına kargo/ağırlık ve tüm ürün adı+renk gruplarına kaplama girin');
+    if (!selectedGroup) {
+      toast.error('Önce bir parent seçin');
+      return;
+    }
+
+    const missingKargo = sizeGroups.filter(sg => !costMap[sg.size]).length;
+    const missingWeight = sizeGroups.filter(sg => {
+      const v = weightMap[sg.size];
+      return v === '' || v === undefined || v === null || Number(v) < 0;
+    }).length;
+    const missingKaplama = nameGroups.filter(ng => !hasKaplamaSelection(kaplamaNameMap[ng.key])).length;
+
+    if (missingKargo > 0 || missingWeight > 0 || (!allowMissingKaplama && missingKaplama > 0)) {
+      const reasons = [];
+      if (missingKargo > 0) reasons.push(`${missingKargo} boyutta kargo eksik`);
+      if (missingWeight > 0) reasons.push(`${missingWeight} boyutta ağırlık eksik`);
+      if (!allowMissingKaplama && missingKaplama > 0) reasons.push(`${missingKaplama} grupta kaplama eksik`);
+      toast.error(`Eksik alanlar var: ${reasons.join(', ')}`);
       return;
     }
     setLoading(true);
@@ -704,6 +723,7 @@ export default function ParentInheritance({ onRefresh }) {
         cost_map: costMap,
         kaplama_map: kaplamaMap,
         kaplama_name_map: cleanKaplamaNameMap,
+        allow_missing_kaplama: allowMissingKaplama,
         weight_map: cleanWeightMap,
         materials: materialInputs,
         sac_material_id: selectedSac || undefined,
@@ -816,6 +836,7 @@ export default function ParentInheritance({ onRefresh }) {
                 setWeightMap({});
                 setSelectedSac(null);
                 setSelectedMdf(null);
+                setAllowMissingKaplama(false);
               }}
               className="text-indigo-400 hover:text-indigo-700 text-sm"
             >Değiştir</button>
@@ -1172,9 +1193,21 @@ export default function ParentInheritance({ onRefresh }) {
             <span className="text-[11px] text-gray-500">{nameGroups.length} grup</span>
             <button
               type="button"
+              onClick={() => setAllowMissingKaplama(prev => !prev)}
+              className={`ml-auto px-3 py-1.5 text-xs rounded border ${
+                allowMissingKaplama
+                  ? 'border-amber-300 bg-amber-50 text-amber-800'
+                  : 'border-gray-200 text-gray-600 hover:bg-gray-50'
+              }`}
+              title="Açık olduğunda kaplama seçimi olmayan gruplar atlanır"
+            >
+              Kaplamayı Atlayarak Uygula: {allowMissingKaplama ? 'Açık' : 'Kapalı'}
+            </button>
+            <button
+              type="button"
               onClick={resetKaplamaSelections}
               disabled={!hasAnyKaplamaSelection}
-              className="ml-auto px-3 py-1.5 text-xs rounded border border-red-200 text-red-700 hover:bg-red-50 disabled:opacity-50 disabled:cursor-not-allowed"
+              className="px-3 py-1.5 text-xs rounded border border-red-200 text-red-700 hover:bg-red-50 disabled:opacity-50 disabled:cursor-not-allowed"
               title="Tüm kaplama seçimlerini temizler"
             >
               Seçimleri Sıfırla
@@ -1191,6 +1224,11 @@ export default function ParentInheritance({ onRefresh }) {
           <p className="text-xs text-gray-500 mb-3">
             Bu alanda bir ürün grubu için birden fazla kaplama seçebilirsin.
           </p>
+          {allowMissingKaplama && (
+            <p className="text-xs text-amber-700 mb-3">
+              Kaplama zorunluluğu kapalı: kaplama seçilmeyen gruplar kaplamasız geçilecek.
+            </p>
+          )}
 
           <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 max-h-[460px] overflow-y-auto pr-1">
             {nameGroups.map(ng => {

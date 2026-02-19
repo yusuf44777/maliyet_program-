@@ -96,6 +96,7 @@ class ParentInheritanceRequest(BaseModel):
     cost_map: dict[str, str]  # { variation_size: cost_name }
     kaplama_map: dict[str, str | list[str]] = Field(default_factory=dict)  # { variation_size: kaplama_cost_name | [kaplama_cost_names] }
     kaplama_name_map: dict[str, str | list[str]] = Field(default_factory=dict)  # { child_name||tier: kaplama_cost_name | [kaplama_cost_names] } (legacy: child_name)
+    allow_missing_kaplama: bool = False  # true ise kaplama eşleşmeyen child'lar kaplama atanmadan devam eder
     weight_map: dict[str, float]  # { variation_size: kargo_agirlik }
     materials: dict[int, float]  # { material_id: quantity }
     sac_material_id: Optional[int] = None  # Seçilen Saç kalınlığı (id), miktar = Alan

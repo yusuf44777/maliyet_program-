@@ -2490,8 +2490,9 @@ def apply_parent_inheritance(req: ParentInheritanceRequest, request: Request):
             if not kaplama_cost_names:
                 kaplama_cost_names = kaplama_source_map.get("*", [])
         if not kaplama_cost_names:
-            skipped_children.append({"child_sku": sku, "variation_size": size, "reason": "no kaplama mapping"})
-            continue
+            if not bool(req.allow_missing_kaplama):
+                skipped_children.append({"child_sku": sku, "variation_size": size, "reason": "no kaplama mapping"})
+                continue
 
         # Resolve cargo weight for this child's size via weight_map
         kargo_agirlik = req.weight_map.get(size)
@@ -2634,6 +2635,7 @@ def apply_parent_inheritance(req: ParentInheritanceRequest, request: Request):
             "size_cost_map_count": len(req.cost_map or {}),
             "size_kaplama_map_count": len(req.kaplama_map or {}),
             "name_kaplama_map_count": len(req.kaplama_name_map or {}),
+            "allow_missing_kaplama": bool(req.allow_missing_kaplama),
             "weight_map_count": len(req.weight_map or {}),
             "approval_id": approval_id,
         },
@@ -2672,6 +2674,7 @@ def apply_parent_inheritance(req: ParentInheritanceRequest, request: Request):
         "cost_map": req.cost_map,
         "kaplama_map": req.kaplama_map,
         "kaplama_name_map": req.kaplama_name_map,
+        "allow_missing_kaplama": bool(req.allow_missing_kaplama),
         "children_updated": len(updated_children),
         "children_skipped": len(skipped_children),
         "details": updated_children,
