@@ -523,6 +523,28 @@ export default function ParentInheritance({ onRefresh }) {
     });
   };
 
+  const resetKargoSelections = () => {
+    setCostMap(prev => {
+      let changed = false;
+      const next = { ...prev };
+      for (const sg of sizeGroups) {
+        if (next[sg.size]) changed = true;
+        next[sg.size] = '';
+      }
+      return changed ? next : prev;
+    });
+    setWeightMap(prev => {
+      let changed = false;
+      const next = { ...prev };
+      for (const sg of sizeGroups) {
+        if (next[sg.size] !== '' && next[sg.size] !== undefined && next[sg.size] !== null) changed = true;
+        next[sg.size] = '';
+      }
+      return changed ? next : prev;
+    });
+    toast.success('Kargo seçimleri sıfırlandı');
+  };
+
   const applyAutoKaplamaNameSuggestions = (overwrite = false) => {
     setKaplamaNameMap(prev => {
       const next = { ...prev };
@@ -541,6 +563,47 @@ export default function ParentInheritance({ onRefresh }) {
       return changed ? next : prev;
     });
   };
+
+  const resetKaplamaSelections = () => {
+    setKaplamaNameMap(prev => {
+      let changed = false;
+      const next = { ...prev };
+      for (const ng of nameGroups) {
+        const current = normalizeKaplamaSelection(next[ng.key]);
+        if (current.length > 0) changed = true;
+        next[ng.key] = [];
+      }
+      return changed ? next : prev;
+    });
+    setKaplamaMap(prev => {
+      let changed = false;
+      const next = { ...prev };
+      for (const sg of sizeGroups) {
+        if (hasKaplamaSelection(next[sg.size])) changed = true;
+        next[sg.size] = '';
+      }
+      return changed ? next : prev;
+    });
+    toast.success('Kaplama seçimleri sıfırlandı');
+  };
+
+  const hasAnyKargoSelection = useMemo(
+    () => sizeGroups.some((sg) => {
+      const hasCost = !!costMap[sg.size];
+      const weight = weightMap[sg.size];
+      const hasWeight = weight !== '' && weight !== undefined && weight !== null;
+      return hasCost || hasWeight;
+    }),
+    [sizeGroups, costMap, weightMap]
+  );
+
+  const hasAnyKaplamaSelection = useMemo(
+    () => (
+      nameGroups.some(ng => hasKaplamaSelection(kaplamaNameMap[ng.key])) ||
+      sizeGroups.some(sg => hasKaplamaSelection(kaplamaMap[sg.size]))
+    ),
+    [nameGroups, sizeGroups, kaplamaNameMap, kaplamaMap]
+  );
 
   useEffect(() => {
     if (!selectedGroup?.parent_name) {
@@ -875,8 +938,17 @@ export default function ParentInheritance({ onRefresh }) {
               <h3 className="font-semibold text-gray-900">Boyut → Kargo</h3>
               <button
                 type="button"
+                onClick={resetKargoSelections}
+                disabled={!hasAnyKargoSelection}
+                className="ml-auto px-2 py-1 text-[11px] rounded border border-red-200 text-red-700 hover:bg-red-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                title="Tüm kargo ve ağırlık seçimlerini temizler"
+              >
+                Seçimleri Sıfırla
+              </button>
+              <button
+                type="button"
                 onClick={() => applyAutoCargoSuggestions(false)}
-                className="ml-auto px-2 py-1 text-[11px] rounded border border-blue-200 text-blue-700 hover:bg-blue-50"
+                className="px-2 py-1 text-[11px] rounded border border-blue-200 text-blue-700 hover:bg-blue-50"
                 title="Boş kargo alanlarını otomatik öneriyle doldurur"
               >
                 Kargoyu Oto Doldur
@@ -1007,8 +1079,17 @@ export default function ParentInheritance({ onRefresh }) {
             <span className="text-[11px] text-gray-500">{nameGroups.length} grup</span>
             <button
               type="button"
+              onClick={resetKaplamaSelections}
+              disabled={!hasAnyKaplamaSelection}
+              className="ml-auto px-3 py-1.5 text-xs rounded border border-red-200 text-red-700 hover:bg-red-50 disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Tüm kaplama seçimlerini temizler"
+            >
+              Seçimleri Sıfırla
+            </button>
+            <button
+              type="button"
               onClick={() => applyAutoKaplamaNameSuggestions(false)}
-              className="ml-auto px-3 py-1.5 text-xs rounded border border-emerald-200 text-emerald-700 hover:bg-emerald-50"
+              className="px-3 py-1.5 text-xs rounded border border-emerald-200 text-emerald-700 hover:bg-emerald-50"
               title="Boş kaplama alanlarını otomatik öneriyle doldurur"
             >
               Kaplamayı Oto Doldur

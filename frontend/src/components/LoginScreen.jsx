@@ -74,6 +74,9 @@ export default function LoginScreen({ onLogin }) {
             Varsayılan hesaplar:
             <div className="mt-1 font-mono">admin / admin</div>
             <div className="font-mono">user / user123</div>
+            <div className="mt-2">
+              Not: `backend/.env` içinde `DEFAULT_*` değerlerini değiştirdiyseniz onları kullanın.
+            </div>
           </div>
         )}
       </div>

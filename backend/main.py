@@ -434,8 +434,8 @@ def write_audit_log(
         pass
 
 
-def ensure_default_users():
-    if not SEED_DEFAULT_USERS:
+def ensure_default_users(force: bool = False):
+    if not force and not SEED_DEFAULT_USERS:
         return
 
     admin_username = os.getenv("DEFAULT_ADMIN_USERNAME", "admin").strip()
@@ -776,7 +776,22 @@ def _do_startup():
         init_db()
         logger.info("[startup] init_db tamamlandı")
         ensure_default_users()
-        logger.info("[startup] ensure_default_users tamamlandı")
+        if SEED_DEFAULT_USERS:
+            logger.info("[startup] ensure_default_users tamamlandı")
+        else:
+            conn = get_db()
+            try:
+                user_count = row_first_value(conn.execute("SELECT COUNT(*) FROM users").fetchone()) or 0
+            finally:
+                conn.close()
+            if not IS_PRODUCTION and user_count == 0:
+                ensure_default_users(force=True)
+                logger.warning(
+                    "[startup] users tablosu boş ve SEED_DEFAULT_USERS=false; "
+                    "local erişim kilitlenmesini önlemek için varsayılan kullanıcılar yüklendi"
+                )
+            else:
+                logger.info("[startup] ensure_default_users atlandı (SEED_DEFAULT_USERS=false)")
         conn = get_db()
         try:
             count = row_first_value(conn.execute("SELECT COUNT(*) FROM products").fetchone()) or 0

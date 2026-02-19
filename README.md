@@ -64,7 +64,7 @@ Temel alanlar:
 - `ENABLE_RELOAD_DB=false`
 - `ENABLE_PRODUCT_SYNC=true` (kategori bazli parent-child guncelleme endpointi)
 - `ENABLE_APPROVAL_WORKFLOW=false` (inherit islemlerini onaya dusurur)
-- `SEED_DEFAULT_USERS=false`
+- `SEED_DEFAULT_USERS=true` (lokalde önerilir, production'da `false`)
 - `PG_POOL_ENABLED=true`
 - `PG_POOL_MIN_CONN=1`
 - `PG_POOL_MAX_CONN=3`
