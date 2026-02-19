@@ -7,12 +7,16 @@ import {
   ArrowUpDown, Eye, Package,
 } from 'lucide-react';
 
+const PAGE_SIZE_OPTIONS = [25, 50, 100];
+
 export default function ProductBrowser({ onSelectProduct, onRefresh }) {
   const [products, setProducts] = useState([]);
   const [groups, setGroups] = useState([]);
   const [viewMode, setViewMode] = useState('table'); // 'table' | 'groups'
   const [loading, setLoading] = useState(false);
-  const [pagination, setPagination] = useState({ page: 1, total: 0, total_pages: 0 });
+  const [groupsLoading, setGroupsLoading] = useState(false);
+  const [pagination, setPagination] = useState({ page: 1, total: 0, total_pages: 0, page_size: 50 });
+  const [groupPagination, setGroupPagination] = useState({ page: 1, total: 0, total_pages: 0, page_size: 50 });
 
   // Filtreler
   const [filters, setFilters] = useState({
@@ -20,7 +24,6 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
     search: '',
     has_dims: '',
     product_identifier: '',
-    page_size: 50,
   });
 
   const [selectedSkus, setSelectedSkus] = useState(new Set());
@@ -28,7 +31,7 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
   const fetchProducts = useCallback(async () => {
     setLoading(true);
     try {
-      const params = { ...filters, page: pagination.page };
+      const params = { ...filters, page: pagination.page, page_size: pagination.page_size };
       // Temizle boş parametreleri
       Object.keys(params).forEach(k => {
         if (params[k] === '' || params[k] === null) delete params[k];
@@ -43,21 +46,46 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
         ...prev,
         total: data.total,
         total_pages: data.total_pages,
+        page_size: data.page_size || prev.page_size,
       }));
     } catch (err) {
       toast.error('Ürünler yüklenemedi');
     }
     setLoading(false);
-  }, [filters, pagination.page]);
+  }, [filters, pagination.page, pagination.page_size]);
 
   const fetchGroups = useCallback(async () => {
+    setGroupsLoading(true);
     try {
-      const data = await getProductGroups(filters.kategori || undefined);
-      setGroups(data);
+      const params = {
+        page: groupPagination.page,
+        page_size: groupPagination.page_size,
+      };
+      if (filters.kategori) params.kategori = filters.kategori;
+      if (filters.search?.trim()) params.search = filters.search.trim();
+
+      const data = await getProductGroups(params);
+      if (Array.isArray(data)) {
+        setGroups(data);
+        setGroupPagination(prev => ({
+          ...prev,
+          total: data.length,
+          total_pages: Math.max(1, Math.ceil(data.length / prev.page_size)),
+        }));
+      } else {
+        setGroups(data.groups || []);
+        setGroupPagination(prev => ({
+          ...prev,
+          total: data.total || 0,
+          total_pages: data.total_pages || 0,
+          page_size: data.page_size || prev.page_size,
+        }));
+      }
     } catch (err) {
-      console.error(err);
+      toast.error('Gruplar yüklenemedi');
     }
-  }, [filters.kategori]);
+    setGroupsLoading(false);
+  }, [filters.kategori, filters.search, groupPagination.page, groupPagination.page_size]);
 
   useEffect(() => {
     fetchProducts();
@@ -113,6 +141,7 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
                 onChange={e => {
                   setFilters(f => ({ ...f, search: e.target.value }));
                   setPagination(p => ({ ...p, page: 1 }));
+                  setGroupPagination(p => ({ ...p, page: 1 }));
                 }}
                 placeholder="SKU, isim veya kod..."
                 className="w-full pl-9 pr-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
@@ -128,6 +157,7 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
               onChange={e => {
                 setFilters(f => ({ ...f, kategori: e.target.value }));
                 setPagination(p => ({ ...p, page: 1 }));
+                setGroupPagination(p => ({ ...p, page: 1 }));
               }}
               className="px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
             >
@@ -152,6 +182,26 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
               <option value="">Tümü</option>
               <option value="true">Boyutlu</option>
               <option value="false">Boyutsuz</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="text-xs text-gray-500 mb-1 block">Satır / Sayfa</label>
+            <select
+              value={viewMode === 'groups' ? groupPagination.page_size : pagination.page_size}
+              onChange={e => {
+                const nextSize = Number(e.target.value) || 50;
+                if (viewMode === 'groups') {
+                  setGroupPagination(p => ({ ...p, page: 1, page_size: nextSize }));
+                } else {
+                  setPagination(p => ({ ...p, page: 1, page_size: nextSize }));
+                }
+              }}
+              className="px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              {PAGE_SIZE_OPTIONS.map(size => (
+                <option key={size} value={size}>{size}</option>
+              ))}
             </select>
           </div>
 
@@ -201,32 +251,70 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
                 </tr>
               </thead>
               <tbody>
-                {groups.map((g, i) => (
-                  <tr key={i} className="cursor-pointer" onClick={() => {
-                    setFilters(f => ({ ...f, product_identifier: g.product_identifier }));
-                    setViewMode('table');
-                    setPagination(p => ({ ...p, page: 1 }));
-                  }}>
-                    <td className="font-mono font-medium">{g.product_identifier}</td>
-                    <td className="max-w-xs truncate">{g.parent_name}</td>
-                    <td>
-                      <span className={`badge ${getCategoryBadgeClass(g.kategori)}`}>
-                        {g.kategori}
-                      </span>
-                    </td>
-                    <td className="text-center">{g.variant_count}</td>
-                    <td>{g.min_en ?? '—'}{g.min_en !== g.max_en ? ` – ${g.max_en}` : ''}</td>
-                    <td>{g.min_boy ?? '—'}{g.min_boy !== g.max_boy ? ` – ${g.max_boy}` : ''}</td>
-                    <td>
-                      <span className="alan-value">
-                        {g.min_alan != null ? g.min_alan.toFixed(4) : '—'}
-                        {g.min_alan !== g.max_alan ? ` – ${g.max_alan?.toFixed(4)}` : ''}
-                      </span>
+                {groupsLoading ? (
+                  <tr>
+                    <td colSpan={7} className="text-center py-8 text-gray-400">
+                      Yükleniyor...
                     </td>
                   </tr>
-                ))}
+                ) : groups.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="text-center py-8 text-gray-400">
+                      Grup bulunamadı
+                    </td>
+                  </tr>
+                ) : (
+                  groups.map((g, i) => (
+                    <tr key={i} className="cursor-pointer" onClick={() => {
+                      setFilters(f => ({ ...f, product_identifier: g.product_identifier }));
+                      setViewMode('table');
+                      setPagination(p => ({ ...p, page: 1 }));
+                    }}>
+                      <td className="font-mono font-medium">{g.product_identifier}</td>
+                      <td className="max-w-xs truncate">{g.parent_name}</td>
+                      <td>
+                        <span className={`badge ${getCategoryBadgeClass(g.kategori)}`}>
+                          {g.kategori}
+                        </span>
+                      </td>
+                      <td className="text-center">{g.variant_count}</td>
+                      <td>{g.min_en ?? '—'}{g.min_en !== g.max_en ? ` – ${g.max_en}` : ''}</td>
+                      <td>{g.min_boy ?? '—'}{g.min_boy !== g.max_boy ? ` – ${g.max_boy}` : ''}</td>
+                      <td>
+                        <span className="alan-value">
+                          {g.min_alan != null ? g.min_alan.toFixed(4) : '—'}
+                          {g.min_alan !== g.max_alan ? ` – ${g.max_alan?.toFixed(4)}` : ''}
+                        </span>
+                      </td>
+                    </tr>
+                  ))
+                )}
               </tbody>
             </table>
+          </div>
+          <div className="flex items-center justify-between px-4 py-3 border-t border-gray-100">
+            <span className="text-sm text-gray-500">
+              Toplam {groupPagination.total.toLocaleString()} grup
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setGroupPagination(p => ({ ...p, page: Math.max(1, p.page - 1) }))}
+                disabled={groupPagination.page <= 1}
+                className="p-1 rounded hover:bg-gray-100 disabled:opacity-30"
+              >
+                <ChevronLeft className="w-5 h-5" />
+              </button>
+              <span className="text-sm text-gray-600">
+                {groupPagination.page} / {Math.max(1, groupPagination.total_pages || 0)}
+              </span>
+              <button
+                onClick={() => setGroupPagination(p => ({ ...p, page: Math.min(Math.max(1, p.total_pages || 1), p.page + 1) }))}
+                disabled={groupPagination.page >= Math.max(1, groupPagination.total_pages || 1)}
+                className="p-1 rounded hover:bg-gray-100 disabled:opacity-30"
+              >
+                <ChevronRight className="w-5 h-5" />
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -345,11 +433,11 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
                   <ChevronLeft className="w-5 h-5" />
                 </button>
                 <span className="text-sm text-gray-600">
-                  {pagination.page} / {pagination.total_pages}
+                  {pagination.page} / {Math.max(1, pagination.total_pages || 0)}
                 </span>
                 <button
-                  onClick={() => setPagination(p => ({ ...p, page: Math.min(p.total_pages, p.page + 1) }))}
-                  disabled={pagination.page >= pagination.total_pages}
+                  onClick={() => setPagination(p => ({ ...p, page: Math.min(Math.max(1, p.total_pages || 1), p.page + 1) }))}
+                  disabled={pagination.page >= Math.max(1, pagination.total_pages || 1)}
                   className="p-1 rounded hover:bg-gray-100 disabled:opacity-30"
                 >
                   <ChevronRight className="w-5 h-5" />

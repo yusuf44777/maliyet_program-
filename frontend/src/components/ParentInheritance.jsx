@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import {
   getProductGroups, getProducts, getMaterials, getCostDefinitions,
   getKargoOptions, getKaplamaNameSuggestions, applyInheritance, exportExcel, getInheritancePrefill,
@@ -20,6 +20,7 @@ const KAPLAMA_GOLD_COPPER_TOKENS = new Set([
   'rosegold',
 ]);
 const KAPLAMA_TIER_ORDER = { silver: 0, gold_copper: 1, other: 2 };
+const PAGE_SIZE_OPTIONS = [25, 50, 100];
 
 function tokenizeKaplama(value) {
   if (!value) return [];
@@ -119,26 +120,80 @@ export default function ParentInheritance({ onRefresh }) {
   const [selectedMdf, setSelectedMdf] = useState(null);     // seçilen MDF material id
   const [kategoriFilter, setKategoriFilter] = useState('');
   const [groupSearch, setGroupSearch] = useState('');
+  const [debouncedGroupSearch, setDebouncedGroupSearch] = useState('');
+  const [groupPagination, setGroupPagination] = useState({
+    page: 1,
+    total: 0,
+    total_pages: 0,
+    page_size: 50,
+  });
 
   // ─── State ───
   const [loading, setLoading] = useState(false);
+  const [groupsLoading, setGroupsLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [expandedGroup, setExpandedGroup] = useState(null);
 
   // ─── Load initial data ───
   useEffect(() => {
     Promise.all([
-      getProductGroups(),
       getMaterials(),
       getCostDefinitions(),
       getKargoOptions(),
-    ]).then(([g, m, cdefs, k]) => {
-      setGroups(g);
+    ]).then(([m, cdefs, k]) => {
       setMaterials(m);
       setCostDefinitions(Array.isArray(cdefs) ? cdefs : []);
       setKargoOptionsRaw(k || []);
     }).catch(err => toast.error('Veri yüklenemedi'));
   }, []);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedGroupSearch(groupSearch.trim());
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [groupSearch]);
+
+  const fetchGroups = useCallback(async () => {
+    setGroupsLoading(true);
+    try {
+      const params = {
+        page: groupPagination.page,
+        page_size: groupPagination.page_size,
+      };
+      if (kategoriFilter) params.kategori = kategoriFilter;
+      if (debouncedGroupSearch) params.search = debouncedGroupSearch;
+
+      const data = await getProductGroups(params);
+      if (Array.isArray(data)) {
+        setGroups(data);
+        setGroupPagination(prev => ({
+          ...prev,
+          total: data.length,
+          total_pages: Math.max(1, Math.ceil(data.length / prev.page_size)),
+        }));
+      } else {
+        setGroups(data.groups || []);
+        setGroupPagination(prev => ({
+          ...prev,
+          total: data.total || 0,
+          total_pages: data.total_pages || 0,
+          page_size: data.page_size || prev.page_size,
+        }));
+      }
+    } catch (err) {
+      toast.error('Parent listesi yüklenemedi');
+    }
+    setGroupsLoading(false);
+  }, [kategoriFilter, debouncedGroupSearch, groupPagination.page, groupPagination.page_size]);
+
+  useEffect(() => {
+    fetchGroups();
+  }, [fetchGroups]);
+
+  useEffect(() => {
+    setExpandedGroup(null);
+  }, [groupPagination.page]);
 
   // ─── Load children when group selected ───
   useEffect(() => {
@@ -321,19 +376,6 @@ export default function ParentInheritance({ onRefresh }) {
       return next;
     });
   }, [nameGroups]);
-
-  // ─── Filtered groups ───
-  const filteredGroups = groups.filter(g => {
-    if (kategoriFilter && g.kategori !== kategoriFilter) return false;
-    if (groupSearch) {
-      const q = groupSearch.toLowerCase();
-      return (
-        (g.parent_name || '').toLowerCase().includes(q) ||
-        (g.parent_name || '').toLowerCase().includes(q)
-      );
-    }
-    return true;
-  });
 
   // ─── Current step ───
   const allCostsMapped = sizeGroups.length > 0 && sizeGroups.every(sg => costMap[sg.size]);
@@ -712,7 +754,11 @@ export default function ParentInheritance({ onRefresh }) {
           <div className="flex gap-2">
             <select
               value={kategoriFilter}
-              onChange={e => setKategoriFilter(e.target.value)}
+              onChange={e => {
+                setKategoriFilter(e.target.value);
+                setGroupPagination(prev => ({ ...prev, page: 1 }));
+                setExpandedGroup(null);
+              }}
               className="px-3 py-1.5 border border-gray-200 rounded-lg text-sm"
             >
               <option value="">Tüm Kategoriler</option>
@@ -725,11 +771,29 @@ export default function ParentInheritance({ onRefresh }) {
               <input
                 type="text"
                 value={groupSearch}
-                onChange={e => setGroupSearch(e.target.value)}
+                onChange={e => {
+                  setGroupSearch(e.target.value);
+                  setGroupPagination(prev => ({ ...prev, page: 1 }));
+                  setExpandedGroup(null);
+                }}
                 placeholder="Parent ara..."
                 className="pl-8 pr-3 py-1.5 border border-gray-200 rounded-lg text-sm w-56 focus:outline-none focus:ring-2 focus:ring-indigo-500"
               />
             </div>
+            <select
+              value={groupPagination.page_size}
+              onChange={e => {
+                const nextSize = Number(e.target.value) || 50;
+                setGroupPagination(prev => ({ ...prev, page: 1, page_size: nextSize }));
+                setExpandedGroup(null);
+              }}
+              className="px-3 py-1.5 border border-gray-200 rounded-lg text-sm"
+              title="Satır / Sayfa"
+            >
+              {PAGE_SIZE_OPTIONS.map(size => (
+                <option key={size} value={size}>{size} / sayfa</option>
+              ))}
+            </select>
           </div>
         </div>
 
@@ -760,10 +824,12 @@ export default function ParentInheritance({ onRefresh }) {
 
         {/* Group list */}
         {!selectedGroup && (
-          <div className="max-h-80 overflow-y-auto border border-gray-100 rounded-lg divide-y divide-gray-100">
-            {filteredGroups.length === 0 ? (
+          <div className="border border-gray-100 rounded-lg divide-y divide-gray-100">
+            {groupsLoading ? (
+              <div className="p-6 text-center text-gray-400 text-sm">Yükleniyor...</div>
+            ) : groups.length === 0 ? (
               <div className="p-6 text-center text-gray-400 text-sm">Sonuç bulunamadı</div>
-            ) : filteredGroups.map(g => (
+            ) : groups.map(g => (
               <div key={`${g.parent_name}-${g.kategori}`}>
                 <button
                   className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-gray-50 transition-colors"
@@ -810,6 +876,33 @@ export default function ParentInheritance({ onRefresh }) {
                 )}
               </div>
             ))}
+            <div className="flex items-center justify-between px-4 py-3 bg-gray-50">
+              <span className="text-xs text-gray-500">
+                Toplam {groupPagination.total.toLocaleString()} parent
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setGroupPagination(prev => ({ ...prev, page: Math.max(1, prev.page - 1) }))}
+                  disabled={groupPagination.page <= 1 || groupsLoading}
+                  className="p-1 rounded hover:bg-gray-100 disabled:opacity-30"
+                >
+                  <ChevronRight className="w-4 h-4 rotate-180 text-gray-500" />
+                </button>
+                <span className="text-xs text-gray-600">
+                  {groupPagination.page} / {Math.max(1, groupPagination.total_pages || 0)}
+                </span>
+                <button
+                  onClick={() => setGroupPagination(prev => ({
+                    ...prev,
+                    page: Math.min(Math.max(1, prev.total_pages || 1), prev.page + 1),
+                  }))}
+                  disabled={groupPagination.page >= Math.max(1, groupPagination.total_pages || 1) || groupsLoading}
+                  className="p-1 rounded hover:bg-gray-100 disabled:opacity-30"
+                >
+                  <ChevronRight className="w-4 h-4 text-gray-500" />
+                </button>
+              </div>
+            </div>
           </div>
         )}
       </div>

@@ -56,8 +56,12 @@ export const getStats = () => api.get('/stats').then(r => r.data);
 // ─── Products ───
 export const getProducts = (params) => api.get('/products', { params }).then(r => r.data);
 export const getProduct = (sku) => api.get(`/products/${encodeURIComponent(sku)}`).then(r => r.data);
-export const getProductGroups = (kategori) =>
-  api.get('/product-groups', { params: kategori ? { kategori } : {} }).then(r => r.data);
+export const getProductGroups = (paramsOrKategori) => {
+  const params = typeof paramsOrKategori === 'string'
+    ? (paramsOrKategori ? { kategori: paramsOrKategori } : {})
+    : (paramsOrKategori || {});
+  return api.get('/product-groups', { params }).then(r => r.data);
+};
 
 // ─── Materials ───
 export const getMaterials = () => api.get('/materials').then(r => r.data);

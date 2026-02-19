@@ -1425,7 +1425,12 @@ def get_product(child_sku: str):
 
 
 @app.get("/api/product-groups")
-def list_product_groups(kategori: Optional[str] = None):
+def list_product_groups(
+    kategori: Optional[str] = None,
+    search: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+):
     """
     Ürünleri parent_name bazında gruplar.
     Aynı parent (maliyet şablonu satırı) altındaki ürünler aynı hammadde yapısını paylaşır.
@@ -1436,6 +1441,9 @@ def list_product_groups(kategori: Optional[str] = None):
     if kategori:
         where_clauses.append("kategori = ?")
         params.append(kategori)
+    if search:
+        where_clauses.append("LOWER(COALESCE(parent_name, '')) LIKE ?")
+        params.append(f"%{search.strip().lower()}%")
     where_sql = "WHERE " + " AND ".join(where_clauses)
 
     identifier_agg_sql = (
@@ -1444,7 +1452,7 @@ def list_product_groups(kategori: Optional[str] = None):
         else "GROUP_CONCAT(DISTINCT product_identifier)"
     )
 
-    rows = conn.execute(f"""
+    grouped_sql = f"""
         SELECT parent_name, kategori,
                COUNT(*) as variant_count,
                COUNT(DISTINCT product_identifier) as sub_group_count,
@@ -1455,10 +1463,32 @@ def list_product_groups(kategori: Optional[str] = None):
         FROM products
         {where_sql}
         GROUP BY parent_name, kategori
+    """
+    total = row_first_value(
+        conn.execute(
+            f"SELECT COUNT(*) FROM ({grouped_sql}) grouped",
+            params,
+        ).fetchone()
+    ) or 0
+
+    offset = (page - 1) * page_size
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM ({grouped_sql}) grouped
         ORDER BY kategori, parent_name
-    """, params).fetchall()
+        LIMIT ? OFFSET ?
+        """,
+        params + [page_size, offset],
+    ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": (total + page_size - 1) // page_size,
+        "groups": [dict(r) for r in rows],
+    }
 
 
 # ─────────────────────────── RAW MATERIALS ───────────────────────────
