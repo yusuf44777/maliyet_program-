@@ -6,7 +6,7 @@ Urun bazli maliyet hesaplama, hammadde/kaplama/kargo yonetimi, parent-child urun
 
 - Backend: FastAPI (`backend/`)
 - Frontend: React + Vite (`frontend/`)
-- Veritabani: SQLite (lokal) / PostgreSQL (production onerilen)
+- Veritabani: PostgreSQL (Supabase)
 
 ## Ozellikler
 
@@ -20,9 +20,9 @@ Urun bazli maliyet hesaplama, hammadde/kaplama/kargo yonetimi, parent-child urun
 ## Proje Yapisi
 
 - `backend/main.py`: API endpointleri ve is kurallari
-- `backend/database.py`: SQLite/PostgreSQL baglanti katmani
+- `backend/database.py`: PostgreSQL baglanti katmani
 - `backend/excel_engine.py`: Excel export motoru
-- `backend/migrate_sqlite_to_postgres.py`: SQLite -> Postgres migration scripti
+- `backend/migrate_sqlite_to_postgres.py`: Legacy SQLite -> Postgres migration scripti
 - `frontend/src/`: React arayuzu
 
 ## Lokal Kurulum
@@ -57,7 +57,7 @@ Varsayilan local URL'ler:
 
 Temel alanlar:
 - `APP_ENV=development|production`
-- `DATABASE_URL=` (PostgreSQL icin production'da zorunlu)
+- `DATABASE_URL=` (zorunlu)
   - Vercel/serverless + Supabase icin `db.<ref>.supabase.co:5432` yerine `pooler.supabase.com:6543` (Transaction Pooler) URL kullanin.
 - `AUTH_SECRET=` (production'da guclu ve min 32 karakter)
 - `CORS_ORIGINS=https://app.example.com`
@@ -81,7 +81,7 @@ Temel alanlar:
 - `VITE_SHOW_DEFAULT_LOGIN_HINTS=false`
 - `VITE_ENABLE_RELOAD_DB=false`
 
-## PostgreSQL'e Gecis
+## Legacy SQLite'dan Migration (Opsiyonel)
 
 1. Postgres provider'dan baglanti string alin (Neon/Supabase vb.).
 2. `backend/.env` icinde `DATABASE_URL` tanimlayin.
@@ -164,7 +164,6 @@ Admin audit listesi: `GET /api/auth/audit-logs`.
 
 - Vercel tarafinda frontend deploy edin.
 - Backend'i serverless disinda uygun bir ortama alin (Render/Railway/Fly/VM).
-- SQLite yerine PostgreSQL kullanin.
 - Varsayilan kullanici bilgilerini production'da kapatin.
 - `reload-db` endpointini production'da kapali tutun.
 

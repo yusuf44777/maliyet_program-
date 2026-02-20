@@ -1,11 +1,11 @@
 """
 Maliyet Sistemi - Veritabanı Modülü
 mapped_products CSV'lerini DB'ye yükler ve alan hesaplamalarını yapar.
-SQLite (lokal) + PostgreSQL (prod) destekler.
+Yalnızca PostgreSQL/Supabase destekler.
 """
 
-import sqlite3
 import csv
+import math
 import re
 import os
 import threading
@@ -45,18 +45,17 @@ if psycopg2 is None:
     except Exception:
         pass
 
-try:
-    import pandas as pd
-except Exception:
-    pd = None
-
 from storage_utils import is_http_url, cache_remote_file
 
-DB_PATH = Path(__file__).parent / "maliyet.db"
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-DB_BACKEND = "postgres" if DATABASE_URL.startswith(("postgres://", "postgresql://")) else "sqlite"
-IS_POSTGRES = DB_BACKEND == "postgres"
-IntegrityError = PgIntegrityError if IS_POSTGRES and PgIntegrityError else sqlite3.IntegrityError
+if not DATABASE_URL.startswith(("postgres://", "postgresql://")):
+    raise RuntimeError(
+        "DATABASE_URL zorunlu ve PostgreSQL formatında olmalı. "
+        "Örnek: postgresql://USER:PASSWORD@HOST:PORT/DB?sslmode=require"
+    )
+DB_BACKEND = "postgres"
+IS_POSTGRES = True
+IntegrityError = PgIntegrityError if PgIntegrityError is not None else Exception
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -81,7 +80,7 @@ def _get_or_create_pg_pool():
     serverless connection spike'larını azaltır.
     """
     global _pg_pool
-    if not (IS_POSTGRES and PG_POOL_ENABLED and ThreadedConnectionPool is not None):
+    if not (PG_POOL_ENABLED and ThreadedConnectionPool is not None):
         return None
     if _pg_pool is not None:
         return _pg_pool
@@ -224,8 +223,6 @@ def adapt_sql_for_backend(sql: str) -> str:
     SQLite-odaklı SQL'i PostgreSQL'e en az sürtünmeyle uyarlar.
     """
     query = str(sql)
-    if not IS_POSTGRES:
-        return query
 
     if INSERT_OR_IGNORE_PATTERN.match(query):
         query = INSERT_OR_IGNORE_PATTERN.sub("INSERT INTO ", query, count=1)
@@ -438,34 +435,29 @@ def split_kaplama_tier_suffix(name: str | None) -> tuple[str, str | None]:
 
 
 def get_db():
-    """Aktif backend'e göre DB bağlantısı döndürür."""
-    if IS_POSTGRES:
-        if psycopg2 is None:
-            raise RuntimeError("PostgreSQL için 'psycopg2-binary' veya 'psycopg' kurulmalı.")
-        pool = _get_or_create_pg_pool()
-        if pool is not None:
-            raw_conn = _acquire_healthy_pooled_conn(pool)
-            try:
-                raw_conn.autocommit = False
-            except Exception:
-                pass
-            return PGCompatConnection(raw_conn, pool=pool)
+    """PostgreSQL bağlantısı döndürür."""
+    if psycopg2 is None:
+        raise RuntimeError("PostgreSQL driver yüklenemedi. 'psycopg2-binary' kurulmalı.")
 
-        try:
-            raw_conn = psycopg2.connect(DATABASE_URL, connect_timeout=PG_CONNECT_TIMEOUT)
-        except TypeError:
-            # psycopg3 compat wrapper sadece dsn parametresi alıyor.
-            raw_conn = psycopg2.connect(DATABASE_URL)
+    pool = _get_or_create_pg_pool()
+    if pool is not None:
+        raw_conn = _acquire_healthy_pooled_conn(pool)
         try:
             raw_conn.autocommit = False
         except Exception:
-            pass  # psycopg3 compat: autocommit zaten connect()'te ayarlandı
-        return PGCompatConnection(raw_conn)
+            pass
+        return PGCompatConnection(raw_conn, pool=pool)
 
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    try:
+        raw_conn = psycopg2.connect(DATABASE_URL, connect_timeout=PG_CONNECT_TIMEOUT)
+    except TypeError:
+        # psycopg3 compat wrapper sadece dsn parametresi alıyor.
+        raw_conn = psycopg2.connect(DATABASE_URL)
+    try:
+        raw_conn.autocommit = False
+    except Exception:
+        pass  # psycopg3 compat: autocommit zaten connect()'te ayarlandı
+    return PGCompatConnection(raw_conn)
 
 
 def parse_dims(dims_str: str) -> tuple[float | None, float | None]:
@@ -473,14 +465,27 @@ def parse_dims(dims_str: str) -> tuple[float | None, float | None]:
     Child_Dims string'ini parse eder.
     Örnek: '(49, 63)' → (49.0, 63.0)
     """
-    if not dims_str:
-        return None, None
-    if pd is not None and pd.isna(dims_str):
+    if _is_blank_or_nan(dims_str):
         return None, None
     match = re.match(r"\((\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)\)", str(dims_str))
     if match:
         return float(match.group(1)), float(match.group(2))
     return None, None
+
+
+def _is_blank_or_nan(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float):
+        try:
+            if math.isnan(value):
+                return True
+        except Exception:
+            pass
+    text = str(value).strip()
+    if not text:
+        return True
+    return text.lower() in {"nan", "none", "null"}
 
 
 def calculate_alan(en: float | None, boy: float | None) -> float | None:
@@ -493,10 +498,7 @@ def calculate_alan(en: float | None, boy: float | None) -> float | None:
 def first_non_empty(*values):
     """İlk dolu (None/boş olmayan) değeri döndürür."""
     for v in values:
-        if v is None:
-            continue
-        s = str(v).strip()
-        if not s or s.lower() == "nan":
+        if _is_blank_or_nan(v):
             continue
         return v
     return None
@@ -504,17 +506,9 @@ def first_non_empty(*values):
 
 def ensure_products_columns(cursor):
     """Mevcut products tablosuna yeni kolonları migrasyonla ekler."""
-    if IS_POSTGRES:
-        for col_name, col_type in PRODUCT_EXTRA_COLUMNS:
-            pg_type = "DOUBLE PRECISION" if col_type.upper() == "REAL" else col_type
-            cursor.execute(f"ALTER TABLE products ADD COLUMN IF NOT EXISTS {col_name} {pg_type}")
-        return
-
-    cols = cursor.execute("PRAGMA table_info(products)").fetchall()
-    existing = {str(c[1]) for c in cols}
     for col_name, col_type in PRODUCT_EXTRA_COLUMNS:
-        if col_name not in existing:
-            cursor.execute(f"ALTER TABLE products ADD COLUMN {col_name} {col_type}")
+        pg_type = "DOUBLE PRECISION" if col_type.upper() == "REAL" else col_type
+        cursor.execute(f"ALTER TABLE products ADD COLUMN IF NOT EXISTS {col_name} {pg_type}")
 
 
 def ensure_audit_logs_columns(cursor):
@@ -527,16 +521,8 @@ def ensure_audit_logs_columns(cursor):
         ("user_agent", "TEXT"),
         ("status", "TEXT"),
     ]
-    if IS_POSTGRES:
-        for col_name, col_type in columns:
-            cursor.execute(f"ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS {col_name} {col_type}")
-        return
-
-    cols = cursor.execute("PRAGMA table_info(audit_logs)").fetchall()
-    existing = {str(c[1]) for c in cols}
     for col_name, col_type in columns:
-        if col_name not in existing:
-            cursor.execute(f"ALTER TABLE audit_logs ADD COLUMN {col_name} {col_type}")
+        cursor.execute(f"ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS {col_name} {col_type}")
 
 
 def ensure_approval_requests_columns(cursor, ref_id_type: str):
@@ -556,16 +542,8 @@ def ensure_approval_requests_columns(cursor, ref_id_type: str):
         ("reviewed_at", "TIMESTAMP"),
         ("executed_at", "TIMESTAMP"),
     ]
-    if IS_POSTGRES:
-        for col_name, col_type in columns:
-            cursor.execute(f"ALTER TABLE approval_requests ADD COLUMN IF NOT EXISTS {col_name} {col_type}")
-        return
-
-    cols = cursor.execute("PRAGMA table_info(approval_requests)").fetchall()
-    existing = {str(c[1]) for c in cols}
     for col_name, col_type in columns:
-        if col_name not in existing:
-            cursor.execute(f"ALTER TABLE approval_requests ADD COLUMN {col_name} {col_type}")
+        cursor.execute(f"ALTER TABLE approval_requests ADD COLUMN IF NOT EXISTS {col_name} {col_type}")
 
 
 def ensure_indexes(cursor):
@@ -613,8 +591,8 @@ def init_db():
     """Veritabanını oluşturur ve tabloları hazırlar."""
     conn = get_db()
     cursor = conn.cursor()
-    id_col = "BIGSERIAL PRIMARY KEY" if IS_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
-    ref_id_type = "BIGINT" if IS_POSTGRES else "INTEGER"
+    id_col = "BIGSERIAL PRIMARY KEY"
+    ref_id_type = "BIGINT"
 
     # Ürünler tablosu
     cursor.execute(f"""
@@ -893,12 +871,8 @@ def load_mapped_products(categories: list[str] | None = None, replace_existing: 
             print(f"⚠ {kategori_name}: CSV bulunamadı, atlanıyor.")
             continue
 
-        if pd is not None:
-            df = pd.read_csv(csv_path)
-            rows = df.to_dict(orient="records")
-        else:
-            with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
-                rows = list(csv.DictReader(f))
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.DictReader(f))
 
         print(f"📦 {kategori_name}: {len(rows)} ürün yükleniyor...")
 
@@ -939,40 +913,30 @@ def load_mapped_products(categories: list[str] | None = None, replace_existing: 
             )
 
             try:
-                if IS_POSTGRES:
-                    cursor.execute("""
-                        INSERT INTO products
-                        (kategori, parent_id, parent_name, child_sku, child_name,
-                         child_code, child_dims, en, boy, alan_m2,
-                         variation_size, variation_color, product_identifier,
-                         match_score, match_method, is_active)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT (child_sku) DO UPDATE SET
-                            kategori = EXCLUDED.kategori,
-                            parent_id = EXCLUDED.parent_id,
-                            parent_name = EXCLUDED.parent_name,
-                            child_name = EXCLUDED.child_name,
-                            child_code = EXCLUDED.child_code,
-                            child_dims = EXCLUDED.child_dims,
-                            en = EXCLUDED.en,
-                            boy = EXCLUDED.boy,
-                            alan_m2 = EXCLUDED.alan_m2,
-                            variation_size = EXCLUDED.variation_size,
-                            variation_color = EXCLUDED.variation_color,
-                            product_identifier = EXCLUDED.product_identifier,
-                            match_score = EXCLUDED.match_score,
-                            match_method = EXCLUDED.match_method,
-                            is_active = EXCLUDED.is_active
-                    """, values)
-                else:
-                    cursor.execute("""
-                        INSERT OR REPLACE INTO products
-                        (kategori, parent_id, parent_name, child_sku, child_name,
-                         child_code, child_dims, en, boy, alan_m2,
-                         variation_size, variation_color, product_identifier,
-                         match_score, match_method, is_active)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, values)
+                cursor.execute("""
+                    INSERT INTO products
+                    (kategori, parent_id, parent_name, child_sku, child_name,
+                     child_code, child_dims, en, boy, alan_m2,
+                     variation_size, variation_color, product_identifier,
+                     match_score, match_method, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (child_sku) DO UPDATE SET
+                        kategori = EXCLUDED.kategori,
+                        parent_id = EXCLUDED.parent_id,
+                        parent_name = EXCLUDED.parent_name,
+                        child_name = EXCLUDED.child_name,
+                        child_code = EXCLUDED.child_code,
+                        child_dims = EXCLUDED.child_dims,
+                        en = EXCLUDED.en,
+                        boy = EXCLUDED.boy,
+                        alan_m2 = EXCLUDED.alan_m2,
+                        variation_size = EXCLUDED.variation_size,
+                        variation_color = EXCLUDED.variation_color,
+                        product_identifier = EXCLUDED.product_identifier,
+                        match_score = EXCLUDED.match_score,
+                        match_method = EXCLUDED.match_method,
+                        is_active = EXCLUDED.is_active
+                """, values)
                 total_loaded += 1
             except Exception as e:
                 print(f"  ⚠ Hata ({child_sku}): {e}")
