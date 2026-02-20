@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { reloadDB, exportExcel, getProducts } from '../api';
+import { useState } from 'react';
+import { reloadDB, exportExcel, getProducts, syncTemplateData } from '../api';
 import toast from 'react-hot-toast';
 import {
   Package,
@@ -12,6 +12,7 @@ import {
   RefreshCw,
   Download,
 } from 'lucide-react';
+import HelpTip from './HelpTip';
 
 const ENABLE_RELOAD_DB = (() => {
   const raw = import.meta.env.VITE_ENABLE_RELOAD_DB;
@@ -80,6 +81,25 @@ export default function Dashboard({ stats, onRefresh, isAdmin = false }) {
     setLoading(false);
   };
 
+  const handleTemplateSync = async () => {
+    if (!isAdmin) return;
+    setLoading(true);
+    try {
+      const result = await syncTemplateData({
+        force_refresh: true,
+        sync_materials: true,
+        sync_costs: true,
+      });
+      toast.success(
+        `Şablon sync tamamlandı: +${result.materials_added} hammadde, +${result.cost_definitions_added} maliyet`,
+      );
+      onRefresh();
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || 'Şablon senkronizasyonu başarısız');
+    }
+    setLoading(false);
+  };
+
   if (!stats) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -109,7 +129,13 @@ export default function Dashboard({ stats, onRefresh, isAdmin = false }) {
 
       {/* Alan Hesaplama Açıklama */}
       <div className="bg-white rounded-xl border border-gray-200 p-6 shadow-sm">
-        <h3 className="text-lg font-semibold text-gray-900 mb-3">Alan Hesaplama Formülü</h3>
+        <div className="flex items-center gap-2 mb-3">
+          <h3 className="text-lg font-semibold text-gray-900">Alan Hesaplama Formülü</h3>
+          <HelpTip
+            title="Neden önemli?"
+            text="Alan değeri, m² bazlı hammaddelerin miktarını otomatik belirler. En ve boy yanlışsa maliyet hesabı da yanlış çıkar."
+          />
+        </div>
         <div className="bg-blue-50 rounded-lg p-4 border border-blue-200">
           <div className="flex items-center gap-3">
             <Ruler className="w-6 h-6 text-blue-600" />
@@ -130,8 +156,24 @@ export default function Dashboard({ stats, onRefresh, isAdmin = false }) {
 
       {/* Aksiyonlar */}
       <div className="bg-white rounded-xl border border-gray-200 p-6 shadow-sm">
-        <h3 className="text-lg font-semibold text-gray-900 mb-4">Hızlı İşlemler</h3>
+        <div className="flex items-center gap-2 mb-4">
+          <h3 className="text-lg font-semibold text-gray-900">Hızlı İşlemler</h3>
+          <HelpTip
+            title="Bu butonlar ne yapar?"
+            text="Senkronizasyon, export ve yeniden yükleme gibi toplu işlemleri tek yerden başlatır. Özellikle şablon değiştiğinde önce senkronizasyon yapın."
+          />
+        </div>
         <div className="flex gap-3">
+          {isAdmin && (
+            <button
+              onClick={handleTemplateSync}
+              disabled={loading}
+              className="flex items-center gap-2 px-4 py-2 bg-emerald-100 text-emerald-700 rounded-lg hover:bg-emerald-200 transition-colors disabled:opacity-50"
+            >
+              <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+              Şablonu Senkronize Et
+            </button>
+          )}
           {isAdmin && ENABLE_RELOAD_DB && (
             <button
               onClick={handleReload}

@@ -65,6 +65,20 @@ export const getProductGroups = (paramsOrKategori, options = {}) => {
 };
 export const searchParentProducts = (params, options = {}) =>
   api.get('/parents/search', { params, ...options }).then(r => r.data);
+export const getParentCostGroups = (params, options = {}) =>
+  api.get('/parent-cost-groups', { params, ...options }).then(r => r.data);
+export const createParentCostGroup = (data) =>
+  api.post('/parent-cost-groups', data).then(r => r.data);
+export const updateParentCostGroup = (groupId, data) =>
+  api.put(`/parent-cost-groups/${groupId}`, data).then(r => r.data);
+export const deleteParentCostGroup = (groupId) =>
+  api.delete(`/parent-cost-groups/${groupId}`).then(r => r.data);
+export const addParentCostGroupItems = (groupId, data) =>
+  api.post(`/parent-cost-groups/${groupId}/items`, data).then(r => r.data);
+export const removeParentCostGroupItems = (groupId, data) =>
+  api.post(`/parent-cost-groups/${groupId}/items/remove`, data).then(r => r.data);
+export const applyParentCostGroupInheritanceAtomic = (groupId, data) =>
+  api.post(`/parent-cost-groups/${groupId}/apply-inheritance-atomic`, data).then(r => r.data);
 
 // ─── Materials ───
 export const getMaterials = () => api.get('/materials').then(r => r.data);
@@ -127,5 +141,7 @@ export const getTemplateStructure = () => api.get('/template-structure').then(r 
 // ─── DB Management ───
 export const reloadDB = () => api.post('/reload-db').then(r => r.data);
 export const syncProducts = (data) => api.post('/sync-products', data).then(r => r.data);
+export const syncTemplateData = (params) =>
+  api.post('/template/sync', null, { params }).then(r => r.data);
 
 export default api;

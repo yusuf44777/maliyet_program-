@@ -593,6 +593,9 @@ def ensure_indexes(cursor):
         "CREATE INDEX IF NOT EXISTS idx_parent_cost_profiles_parent_id ON parent_cost_profiles(parent_id)",
         "CREATE INDEX IF NOT EXISTS idx_product_cost_breakdowns_parent_id ON product_cost_breakdowns(parent_id)",
         "CREATE INDEX IF NOT EXISTS idx_product_cost_breakdowns_child_sku ON product_cost_breakdowns(child_sku)",
+        "CREATE INDEX IF NOT EXISTS idx_parent_cost_groups_name ON parent_cost_groups(name)",
+        "CREATE INDEX IF NOT EXISTS idx_parent_cost_group_items_group_id ON parent_cost_group_items(group_id)",
+        "CREATE INDEX IF NOT EXISTS idx_parent_cost_group_items_parent_name ON parent_cost_group_items(parent_name)",
         "CREATE INDEX IF NOT EXISTS idx_users_role_active ON users(role, is_active)",
         "CREATE INDEX IF NOT EXISTS idx_users_username_lower ON users(LOWER(username))",
         "CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at)",
@@ -706,6 +709,33 @@ def init_db():
             updated_by_username TEXT,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (child_sku) REFERENCES products(child_sku)
+        )
+    """)
+
+    # Parent maliyet grupları (birden fazla parent'ı aynı maliyet setinde toplamak için)
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS parent_cost_groups (
+            id {id_col},
+            name TEXT NOT NULL UNIQUE,
+            description TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_by {ref_id_type},
+            created_by_username TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Parent maliyet grup üyeleri
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS parent_cost_group_items (
+            id {id_col},
+            group_id {ref_id_type} NOT NULL,
+            parent_name TEXT NOT NULL,
+            kategori TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (group_id) REFERENCES parent_cost_groups(id),
+            UNIQUE(group_id, parent_name)
         )
     """)
 
@@ -1005,7 +1035,8 @@ def load_default_materials():
                     INSERT OR IGNORE INTO raw_materials (name, unit, unit_price)
                     VALUES (?, ?, 0)
                 """, (name, unit))
-                material_count += 1
+                if int(getattr(cursor, "rowcount", 0) or 0) > 0:
+                    material_count += 1
             except Exception as e:
                 print(f"  ⚠ Hammadde yüklenirken hata ({name}): {e}")
 
@@ -1013,6 +1044,7 @@ def load_default_materials():
     conn.close()
     wb.close()
     print(f"✅ {material_count} hammadde tanımı yüklendi.")
+    return material_count
 
 
 def extract_kargo_code_from_name(name: str | None) -> str | None:

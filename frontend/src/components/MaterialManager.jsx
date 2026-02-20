@@ -5,6 +5,7 @@ import {
 } from '../api';
 import toast from 'react-hot-toast';
 import { Save, DollarSign, Search, Plus, Trash2, Package } from 'lucide-react';
+import HelpTip from './HelpTip';
 
 export default function MaterialManager({ onRefresh }) {
   const [materials, setMaterials] = useState([]);
@@ -236,6 +237,10 @@ export default function MaterialManager({ onRefresh }) {
           <div className="flex items-center gap-3">
             <DollarSign className="w-5 h-5 text-green-600" />
             <h2 className="text-lg font-semibold">Hammadde Birim Fiyatları</h2>
+            <HelpTip
+              title="Neden burada fiyat var?"
+              text="Birim fiyatlar, ürün maliyeti hesaplarının temelidir. Boş fiyat kalan hammaddeler toplam maliyeti eksik gösterir."
+            />
           </div>
           <div className="flex items-center gap-3">
             <div className="relative">
@@ -262,7 +267,13 @@ export default function MaterialManager({ onRefresh }) {
       </div>
 
       <div className="bg-white rounded-xl border border-gray-200 p-4 shadow-sm">
-        <h3 className="text-sm font-semibold text-gray-700 mb-3">Yeni Hammadde Ekle</h3>
+        <div className="flex items-center gap-2 mb-3">
+          <h3 className="text-sm font-semibold text-gray-700">Yeni Hammadde Ekle</h3>
+          <HelpTip
+            title="Ne zaman eklenir?"
+            text="Excel şablonunda yeni bir hammadde çıktıysa burada ekleyin. Birim ve para birimini doğru seçin."
+          />
+        </div>
         <div className="grid grid-cols-1 md:grid-cols-5 gap-2">
           <input
             type="text"
@@ -400,6 +411,10 @@ export default function MaterialManager({ onRefresh }) {
           <div className="flex items-center gap-2">
             <Package className="w-5 h-5 text-orange-600" />
             <h2 className="text-lg font-semibold">Kargo / Kaplama Maliyet Kalemleri</h2>
+            <HelpTip
+              title="Maliyet kalemi nedir?"
+              text="Kargo ve kaplama seçenekleri aktarım ekranlarında bu listeden gelir. Yanlış ad/kod olursa eşleşme bozulur."
+            />
           </div>
           <div className="flex items-center gap-2">
             <select

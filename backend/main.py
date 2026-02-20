@@ -35,6 +35,7 @@ from database import (
     sync_cost_definitions_from_template, list_cost_definitions,
     canonicalize_kaplama_cost_name, normalize_legacy_gold_silver_names,
     deactivate_shadowed_kaplama_base_names, deactivate_cus_products,
+    resolve_template_path,
     normalize_product_categories, get_supported_categories,
     DB_BACKEND, DATABASE_URL,
     IntegrityError as DBIntegrityError,
@@ -47,9 +48,11 @@ from models import (
     CostDefinitionCreate, CostDefinitionUpdate,
     AuthLoginRequest, AuthChangePasswordRequest, AuthUserCreate, AuthUserUpdate,
     ParentSearchItem, CostPropagationRequest,
+    ParentCostGroupCreate, ParentCostGroupUpdate, ParentCostGroupItemsRequest,
+    ParentCostGroupInheritanceApplyRequest,
 )
 from excel_engine import export_to_template, get_template_structure
-from storage_utils import is_http_url, cache_remote_file
+from storage_utils import is_http_url, cache_remote_file, invalidate_remote_cache
 
 app = FastAPI(
     title="Maliyet Sistemi API",
@@ -161,6 +164,7 @@ ADMIN_ONLY_RULES: list[tuple[str, str]] = [
     ("POST", "/api/sync-products"),
     ("POST", "/api/products/deactivate-cus"),
     ("POST", "/api/cost-propagation/apply"),
+    ("POST", "/api/template/sync"),
     ("GET", "/api/quality/report"),
     ("GET", "/api/approvals"),
     ("POST", "/api/approvals/"),
@@ -366,6 +370,102 @@ def normalize_cost_breakdown_payload(payload: dict | None) -> dict:
             pass
         out[key] = text_value[:512]
 
+    return out
+
+
+def normalize_parent_group_name(value: str | None) -> str:
+    name = str(value or "").strip()
+    if not name:
+        return ""
+    return re.sub(r"\s+", " ", name)[:120]
+
+
+def normalize_parent_group_description(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return text[:500]
+
+
+def normalize_parent_group_item(value: dict | None) -> tuple[str, str | None] | None:
+    if not isinstance(value, dict):
+        return None
+    parent_name = str(value.get("parent_name") or "").strip()
+    if not parent_name:
+        return None
+    kategori = str(value.get("kategori") or "").strip() or None
+    return parent_name, kategori
+
+
+def list_parent_cost_groups_data(include_items: bool = False, active_only: bool = False) -> list[dict]:
+    conn = get_db()
+    where_sql = ""
+    params: list = []
+    if active_only:
+        where_sql = "WHERE COALESCE(g.is_active, 1) = 1"
+    rows = conn.execute(
+        f"""
+        SELECT
+            g.id, g.name, g.description, g.is_active,
+            g.created_by, g.created_by_username,
+            g.created_at, g.updated_at,
+            COUNT(i.id) AS parent_count
+        FROM parent_cost_groups g
+        LEFT JOIN parent_cost_group_items i ON i.group_id = g.id
+        {where_sql}
+        GROUP BY g.id, g.name, g.description, g.is_active,
+                 g.created_by, g.created_by_username, g.created_at, g.updated_at
+        ORDER BY g.updated_at DESC, g.id DESC
+        """,
+        params,
+    ).fetchall()
+
+    out: list[dict] = []
+    group_ids: list[int] = []
+    for row in rows:
+        group_id = int(row["id"])
+        group_ids.append(group_id)
+        out.append(
+            {
+                "id": group_id,
+                "name": str(row["name"] or ""),
+                "description": row["description"],
+                "is_active": bool(row["is_active"]),
+                "parent_count": int(row["parent_count"] or 0),
+                "created_by": row["created_by"],
+                "created_by_username": row["created_by_username"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "items": [],
+            }
+        )
+
+    if include_items and group_ids:
+        placeholders = ", ".join(["?"] * len(group_ids))
+        item_rows = conn.execute(
+            f"""
+            SELECT group_id, parent_name, kategori
+            FROM parent_cost_group_items
+            WHERE group_id IN ({placeholders})
+            ORDER BY parent_name
+            """,
+            group_ids,
+        ).fetchall()
+        items_by_group: dict[int, list[dict]] = defaultdict(list)
+        for row in item_rows:
+            items_by_group[int(row["group_id"])].append(
+                {
+                    "parent_name": str(row["parent_name"] or ""),
+                    "kategori": row["kategori"],
+                }
+            )
+        for group in out:
+            group["items"] = items_by_group.get(int(group["id"]), [])
+
+    conn.close()
+    if not include_items:
+        for group in out:
+            group.pop("items", None)
     return out
 
 
@@ -1781,6 +1881,248 @@ def search_parent_products(
     return result
 
 
+@app.get("/api/parent-cost-groups")
+def list_parent_cost_groups(
+    request: Request,
+    include_items: bool = Query(True),
+    active_only: bool = Query(True),
+):
+    require_request_user(request)
+    return list_parent_cost_groups_data(include_items=bool(include_items), active_only=bool(active_only))
+
+
+@app.post("/api/parent-cost-groups")
+def create_parent_cost_group(data: ParentCostGroupCreate, request: Request):
+    user = require_request_user(request)
+    name = normalize_parent_group_name(data.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="Grup adı boş olamaz")
+    description = normalize_parent_group_description(data.description)
+
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO parent_cost_groups (name, description, is_active, created_by, created_by_username, updated_at)
+            VALUES (?, ?, 1, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (name, description, user["id"], user["username"]),
+        )
+        group_id = int(getattr(cur, "lastrowid", 0) or 0)
+        conn.commit()
+    except DBIntegrityError:
+        conn.close()
+        raise HTTPException(status_code=409, detail="Bu grup adı zaten var")
+    conn.close()
+
+    created = next((g for g in list_parent_cost_groups_data(include_items=True, active_only=False) if int(g["id"]) == group_id), None)
+    write_audit_log(user, "parent_groups.create", target=name, details={"group_id": group_id})
+    return created or {"id": group_id, "name": name, "description": description, "is_active": True, "parent_count": 0, "items": []}
+
+
+@app.put("/api/parent-cost-groups/{group_id}")
+def update_parent_cost_group(group_id: int, data: ParentCostGroupUpdate, request: Request):
+    user = require_request_user(request)
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id, name, description, is_active FROM parent_cost_groups WHERE id = ?",
+        (group_id,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Parent grubu bulunamadı")
+
+    next_name = normalize_parent_group_name(data.name) if data.name is not None else str(row["name"] or "")
+    next_description = normalize_parent_group_description(data.description) if data.description is not None else row["description"]
+    next_is_active = int(data.is_active) if data.is_active is not None else int(row["is_active"] or 0)
+
+    if not next_name:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Grup adı boş olamaz")
+
+    try:
+        conn.execute(
+            """
+            UPDATE parent_cost_groups
+            SET name = ?, description = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (next_name, next_description, next_is_active, group_id),
+        )
+        conn.commit()
+    except DBIntegrityError:
+        conn.close()
+        raise HTTPException(status_code=409, detail="Bu grup adı zaten var")
+    conn.close()
+
+    updated = next((g for g in list_parent_cost_groups_data(include_items=True, active_only=False) if int(g["id"]) == int(group_id)), None)
+    write_audit_log(
+        user,
+        "parent_groups.update",
+        target=str(group_id),
+        details={"name": next_name, "is_active": bool(next_is_active)},
+    )
+    return updated or {"id": group_id, "name": next_name, "description": next_description, "is_active": bool(next_is_active)}
+
+
+@app.delete("/api/parent-cost-groups/{group_id}")
+def delete_parent_cost_group(group_id: int, request: Request):
+    user = require_request_user(request)
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id, name FROM parent_cost_groups WHERE id = ?",
+        (group_id,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Parent grubu bulunamadı")
+
+    conn.execute("DELETE FROM parent_cost_group_items WHERE group_id = ?", (group_id,))
+    conn.execute("DELETE FROM parent_cost_groups WHERE id = ?", (group_id,))
+    conn.commit()
+    conn.close()
+
+    write_audit_log(user, "parent_groups.delete", target=str(group_id), details={"name": row["name"]})
+    return {"status": "ok", "deleted_group_id": int(group_id), "name": row["name"]}
+
+
+@app.post("/api/parent-cost-groups/{group_id}/items")
+def add_parent_cost_group_items(group_id: int, data: ParentCostGroupItemsRequest, request: Request):
+    user = require_request_user(request)
+    normalized_items: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
+    for raw in data.parents or []:
+        item = normalize_parent_group_item(raw.model_dump() if hasattr(raw, "model_dump") else raw)
+        if not item:
+            continue
+        key = item[0].casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized_items.append(item)
+
+    if not normalized_items:
+        raise HTTPException(status_code=400, detail="Eklenecek parent listesi boş")
+
+    conn = get_db()
+    group_row = conn.execute(
+        "SELECT id, name, is_active FROM parent_cost_groups WHERE id = ?",
+        (group_id,),
+    ).fetchone()
+    if not group_row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Parent grubu bulunamadı")
+    if int(group_row["is_active"] or 0) != 1:
+        conn.close()
+        raise HTTPException(status_code=409, detail="Pasif gruba parent eklenemez")
+
+    names = [name for name, _ in normalized_items]
+    placeholders = ", ".join(["?"] * len(names))
+    existing_rows = conn.execute(
+        f"""
+        SELECT DISTINCT parent_name
+        FROM products
+        WHERE is_active = 1
+          AND parent_name IN ({placeholders})
+        """,
+        names,
+    ).fetchall()
+    existing_names = {str(r["parent_name"] or "").strip().casefold() for r in existing_rows}
+    missing_names: list[str] = []
+    upserts: list[tuple[int, str, str | None]] = []
+    for parent_name, kategori in normalized_items:
+        if parent_name.casefold() not in existing_names:
+            missing_names.append(parent_name)
+            continue
+        upserts.append((int(group_id), parent_name, kategori))
+
+    if upserts:
+        conn.executemany(
+            """
+            INSERT INTO parent_cost_group_items (group_id, parent_name, kategori)
+            VALUES (?, ?, ?)
+            ON CONFLICT(group_id, parent_name) DO UPDATE SET
+                kategori = COALESCE(EXCLUDED.kategori, parent_cost_group_items.kategori)
+            """,
+            upserts,
+        )
+        conn.commit()
+    conn.close()
+
+    group = next((g for g in list_parent_cost_groups_data(include_items=True, active_only=False) if int(g["id"]) == int(group_id)), None)
+    write_audit_log(
+        user,
+        "parent_groups.items_add",
+        target=str(group_id),
+        details={
+            "added_count": len(upserts),
+            "missing_count": len(missing_names),
+            "missing_parents": missing_names,
+        },
+    )
+    return {
+        "status": "ok",
+        "group": group,
+        "added_count": len(upserts),
+        "missing_count": len(missing_names),
+        "missing_parents": missing_names,
+    }
+
+
+@app.post("/api/parent-cost-groups/{group_id}/items/remove")
+def remove_parent_cost_group_items(group_id: int, data: ParentCostGroupItemsRequest, request: Request):
+    user = require_request_user(request)
+    names: list[str] = []
+    seen: set[str] = set()
+    for raw in data.parents or []:
+        item = normalize_parent_group_item(raw.model_dump() if hasattr(raw, "model_dump") else raw)
+        if not item:
+            continue
+        key = item[0].casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(item[0])
+
+    if not names:
+        raise HTTPException(status_code=400, detail="Silinecek parent listesi boş")
+
+    conn = get_db()
+    group_row = conn.execute(
+        "SELECT id, name FROM parent_cost_groups WHERE id = ?",
+        (group_id,),
+    ).fetchone()
+    if not group_row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Parent grubu bulunamadı")
+
+    placeholders = ", ".join(["?"] * len(names))
+    cur = conn.execute(
+        f"""
+        DELETE FROM parent_cost_group_items
+        WHERE group_id = ?
+          AND parent_name IN ({placeholders})
+        """,
+        [group_id, *names],
+    )
+    removed_count = int(cur.rowcount or 0) if int(cur.rowcount or 0) > 0 else 0
+    conn.commit()
+    conn.close()
+
+    group = next((g for g in list_parent_cost_groups_data(include_items=True, active_only=False) if int(g["id"]) == int(group_id)), None)
+    write_audit_log(
+        user,
+        "parent_groups.items_remove",
+        target=str(group_id),
+        details={"removed_count": removed_count, "parents": names},
+    )
+    return {
+        "status": "ok",
+        "group": group,
+        "removed_count": removed_count,
+    }
+
+
 # ─────────────────────────── RAW MATERIALS ───────────────────────────
 
 @app.get("/api/materials")
@@ -2741,6 +3083,302 @@ def get_parent_inheritance_prefill(parent_name: str):
         conn.close()
 
 
+def _apply_parent_inheritance_core(
+    conn,
+    req: ParentInheritanceRequest,
+    kargo_lookup: dict[str, dict] | None = None,
+) -> dict:
+    if kargo_lookup is None:
+        kargo_lookup = load_kargo_lookup()
+
+    children = conn.execute(
+        """
+        SELECT child_sku, child_name, alan_m2, variation_size, variation_color
+        FROM products
+        WHERE parent_name = ? AND is_active = 1
+        """,
+        (req.parent_name,)
+    ).fetchall()
+
+    if not children:
+        raise HTTPException(status_code=404, detail="Bu parent altında ürün bulunamadı")
+
+    strafor_row = conn.execute(
+        "SELECT id FROM raw_materials WHERE name LIKE '%Strafor%' LIMIT 1"
+    ).fetchone()
+    boya_row = conn.execute(
+        "SELECT id FROM raw_materials WHERE name LIKE '%Boya%İşçilik%' OR name LIKE '%Boya + İşçilik%' LIMIT 1"
+    ).fetchone()
+
+    strafor_id = strafor_row["id"] if strafor_row else None
+    boya_id = boya_row["id"] if boya_row else None
+    sac_id = req.sac_material_id
+    mdf_id = req.mdf_material_id
+    auto_ids = {strafor_id, boya_id, sac_id, mdf_id} - {None}
+
+    manual_material_assignments: list[tuple[int, float]] = []
+    for mat_id_raw, quantity_raw in (req.materials or {}).items():
+        try:
+            mat_id = int(mat_id_raw)
+            quantity = float(quantity_raw)
+        except (TypeError, ValueError):
+            continue
+        if mat_id in auto_ids:
+            continue
+        manual_material_assignments.append((mat_id, quantity))
+
+    inherit_detail_limit = max(0, int(os.getenv("INHERIT_RESPONSE_DETAIL_LIMIT", "250")))
+    updated_children_count = 0
+    skipped_children_count = 0
+    updated_children_sample: list[dict] = []
+    skipped_children_sample: list[dict] = []
+    product_updates: list[tuple] = []
+    material_upserts: list[tuple] = []
+    cost_upserts: list[tuple] = []
+
+    kaplama_name_map_exact: dict[str, list[str]] = {}
+    kaplama_name_map_ci: dict[str, list[str]] = {}
+    for k, v in (req.kaplama_name_map or {}).items():
+        key = str(k).strip()
+        if not key:
+            continue
+        names = normalize_cost_name_list(v, canonicalize_kaplama=True)
+        if not names:
+            continue
+        kaplama_name_map_exact[key] = names
+        kaplama_name_map_ci[key.lower()] = names
+
+    kaplama_map_by_size: dict[str, list[str]] = {}
+    for k, v in (req.kaplama_map or {}).items():
+        key = str(k).strip()
+        if not key:
+            continue
+        names = normalize_cost_name_list(v, canonicalize_kaplama=True)
+        if not names:
+            continue
+        kaplama_map_by_size[key] = names
+
+    kaplama_fallback_from_cost_map: dict[str, list[str]] = {}
+    for k, v in (req.cost_map or {}).items():
+        key = str(k).strip()
+        if not key:
+            continue
+        names = normalize_cost_name_list(v, canonicalize_kaplama=True)
+        if not names:
+            continue
+        kaplama_fallback_from_cost_map[key] = names
+
+    for child in children:
+        sku = child["child_sku"]
+        child_name = (child["child_name"] or "").strip()
+        variation_color = (child["variation_color"] or "").strip()
+        alan = child["alan_m2"]
+        size = child["variation_size"] or "(boyutsuz)"
+
+        kargo_cost_name = req.cost_map.get(size)
+        if not kargo_cost_name:
+            kargo_cost_name = req.cost_map.get("*")
+        if not kargo_cost_name:
+            skipped_children_count += 1
+            if inherit_detail_limit > 0 and len(skipped_children_sample) < inherit_detail_limit:
+                skipped_children_sample.append({"child_sku": sku, "variation_size": size, "reason": "no kargo mapping"})
+            continue
+
+        kaplama_cost_names: list[str] = []
+        if child_name:
+            lookup_keys = []
+            tier_key = build_kaplama_group_key(
+                child_name,
+                detect_kaplama_tier(child_name, variation_color),
+            )
+            if tier_key:
+                lookup_keys.append(tier_key)
+            if variation_color:
+                lookup_keys.append(f"{child_name}||{variation_color}")
+            lookup_keys.append(child_name)
+
+            seen_keys = set()
+            for lookup_key in lookup_keys:
+                normalized_lookup = lookup_key.strip()
+                if not normalized_lookup:
+                    continue
+                lowered_lookup = normalized_lookup.lower()
+                if lowered_lookup in seen_keys:
+                    continue
+                seen_keys.add(lowered_lookup)
+                kaplama_cost_names = kaplama_name_map_exact.get(normalized_lookup, [])
+                if not kaplama_cost_names:
+                    kaplama_cost_names = kaplama_name_map_ci.get(lowered_lookup, [])
+                if kaplama_cost_names:
+                    break
+        if not kaplama_cost_names:
+            if kaplama_map_by_size:
+                kaplama_source_map = kaplama_map_by_size
+            elif kaplama_name_map_exact:
+                kaplama_source_map = {}
+            else:
+                kaplama_source_map = kaplama_fallback_from_cost_map
+            kaplama_cost_names = kaplama_source_map.get(size, [])
+            if not kaplama_cost_names:
+                kaplama_cost_names = kaplama_source_map.get("*", [])
+        if not kaplama_cost_names:
+            if not bool(req.allow_missing_kaplama):
+                skipped_children_count += 1
+                if inherit_detail_limit > 0 and len(skipped_children_sample) < inherit_detail_limit:
+                    skipped_children_sample.append({"child_sku": sku, "variation_size": size, "reason": "no kaplama mapping"})
+                continue
+
+        kargo_agirlik = req.weight_map.get(size)
+        if kargo_agirlik is None:
+            kargo_agirlik = req.weight_map.get("*")
+        if kargo_agirlik is None:
+            skipped_children_count += 1
+            if inherit_detail_limit > 0 and len(skipped_children_sample) < inherit_detail_limit:
+                skipped_children_sample.append({"child_sku": sku, "variation_size": size, "reason": "no weight mapping"})
+            continue
+        try:
+            kargo_agirlik = float(kargo_agirlik)
+        except (TypeError, ValueError):
+            skipped_children_count += 1
+            if inherit_detail_limit > 0 and len(skipped_children_sample) < inherit_detail_limit:
+                skipped_children_sample.append({"child_sku": sku, "variation_size": size, "reason": "invalid weight"})
+            continue
+        if kargo_agirlik < 0:
+            skipped_children_count += 1
+            if inherit_detail_limit > 0 and len(skipped_children_sample) < inherit_detail_limit:
+                skipped_children_sample.append({"child_sku": sku, "variation_size": size, "reason": "negative weight"})
+            continue
+
+        kargo_kodu = normalize_kargo_code(kargo_cost_name)
+        kargo_meta = kargo_lookup.get(kargo_kodu) if kargo_kodu else None
+        kargo_en = kargo_meta["kargo_en"] if kargo_meta else None
+        kargo_boy = kargo_meta["kargo_boy"] if kargo_meta else None
+        kargo_yukseklik = kargo_meta["kargo_yukseklik"] if kargo_meta else None
+        kargo_desi = calculate_kargo_desi(kargo_en, kargo_boy, kargo_yukseklik, kargo_agirlik)
+
+        rounded_agirlik = round(kargo_agirlik, 6)
+        product_updates.append((
+            kargo_kodu,
+            kargo_en,
+            kargo_boy,
+            kargo_yukseklik,
+            rounded_agirlik,
+            kargo_desi,
+            sku,
+        ))
+
+        for mat_id, quantity in manual_material_assignments:
+            material_upserts.append((sku, mat_id, quantity, quantity))
+
+        assigned_costs = [kargo_cost_name, *kaplama_cost_names]
+        seen_assigned: set[str] = set()
+        for assigned_cost in assigned_costs:
+            assigned_cost = str(assigned_cost or "").strip()
+            if not assigned_cost:
+                continue
+            key = assigned_cost.casefold()
+            if key in seen_assigned:
+                continue
+            seen_assigned.add(key)
+            cost_upserts.append((sku, assigned_cost))
+
+        child_result = {
+            "child_sku": sku, "alan_m2": alan,
+            "variation_size": size,
+            "cost_name": kargo_cost_name,
+            "kargo_cost_name": kargo_cost_name,
+            "kaplama_cost_name": kaplama_cost_names[0] if kaplama_cost_names else None,
+            "kaplama_cost_names": kaplama_cost_names,
+            "kargo_kodu": kargo_kodu,
+            "kargo_en": kargo_en,
+            "kargo_boy": kargo_boy,
+            "kargo_yukseklik": kargo_yukseklik,
+            "kargo_agirlik": rounded_agirlik,
+            "kargo_desi": kargo_desi,
+            "strafor": None, "boya_iscilik": None, "sac": None, "mdf": None,
+        }
+
+        if alan is not None:
+            if strafor_id is not None:
+                strafor_qty = round(alan * 1.2, 6)
+                material_upserts.append((sku, strafor_id, strafor_qty, strafor_qty))
+                child_result["strafor"] = strafor_qty
+
+            if boya_id is not None:
+                boya_qty = round(alan * 5, 6)
+                material_upserts.append((sku, boya_id, boya_qty, boya_qty))
+                child_result["boya_iscilik"] = boya_qty
+
+            if sac_id is not None:
+                sac_qty = round(alan, 6)
+                material_upserts.append((sku, sac_id, sac_qty, sac_qty))
+                child_result["sac"] = sac_qty
+
+            if mdf_id is not None:
+                mdf_qty = round(alan, 6)
+                material_upserts.append((sku, mdf_id, mdf_qty, mdf_qty))
+                child_result["mdf"] = mdf_qty
+
+        updated_children_count += 1
+        if inherit_detail_limit > 0 and len(updated_children_sample) < inherit_detail_limit:
+            updated_children_sample.append(child_result)
+
+    if product_updates:
+        conn.executemany(
+            """
+            UPDATE products
+            SET kargo_kodu = ?,
+                kargo_en = ?,
+                kargo_boy = ?,
+                kargo_yukseklik = ?,
+                kargo_agirlik = ?,
+                kargo_desi = ?
+            WHERE child_sku = ?
+            """,
+            product_updates,
+        )
+
+    if material_upserts:
+        conn.executemany(
+            """
+            INSERT INTO product_materials (child_sku, material_id, quantity)
+            VALUES (?, ?, ?)
+            ON CONFLICT(child_sku, material_id) DO UPDATE SET quantity = ?
+            """,
+            material_upserts,
+        )
+
+    if cost_upserts:
+        conn.executemany(
+            """
+            INSERT INTO product_costs (child_sku, cost_name, assigned)
+            VALUES (?, ?, 1)
+            ON CONFLICT(child_sku, cost_name) DO UPDATE SET assigned = 1
+            """,
+            cost_upserts,
+        )
+
+    return {
+        "status": "ok",
+        "parent": req.parent_name,
+        "cost_map": req.cost_map,
+        "kaplama_map": req.kaplama_map,
+        "kaplama_name_map": req.kaplama_name_map,
+        "allow_missing_kaplama": bool(req.allow_missing_kaplama),
+        "children_updated": updated_children_count,
+        "children_skipped": skipped_children_count,
+        "details": updated_children_sample,
+        "details_truncated": max(0, updated_children_count - len(updated_children_sample)),
+        "skipped": skipped_children_sample,
+        "skipped_truncated": max(0, skipped_children_count - len(skipped_children_sample)),
+        "_metrics": {
+            "product_updates": len(product_updates),
+            "material_upserts": len(material_upserts),
+            "cost_upserts": len(cost_upserts),
+        },
+    }
+
+
 @app.post("/api/inherit")
 def apply_parent_inheritance(req: ParentInheritanceRequest, request: Request):
     """
@@ -2813,302 +3451,33 @@ def apply_parent_inheritance(req: ParentInheritanceRequest, request: Request):
             raise HTTPException(status_code=400, detail="Onay sonrası payload değişmiş. Yeniden onay isteği açın.")
 
     conn = get_db()
-    kargo_lookup = load_kargo_lookup()
-
-    # Fetch all children with their variation_size — use parent_name for grouping
-    children = conn.execute(
-        """
-        SELECT child_sku, child_name, alan_m2, variation_size, variation_color
-        FROM products
-        WHERE parent_name = ? AND is_active = 1
-        """,
-        (req.parent_name,)
-    ).fetchall()
-
-    if not children:
+    try:
+        core_result = _apply_parent_inheritance_core(conn, req)
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         conn.close()
-        raise HTTPException(status_code=404, detail="Bu parent altında ürün bulunamadı")
-
-    # Resolve material IDs for Strafor and Boya + İşçilik
-    strafor_row = conn.execute(
-        "SELECT id FROM raw_materials WHERE name LIKE '%Strafor%' LIMIT 1"
-    ).fetchone()
-    boya_row = conn.execute(
-        "SELECT id FROM raw_materials WHERE name LIKE '%Boya%İşçilik%' OR name LIKE '%Boya + İşçilik%' LIMIT 1"
-    ).fetchone()
-
-    strafor_id = strafor_row["id"] if strafor_row else None
-    boya_id = boya_row["id"] if boya_row else None
-    sac_id = req.sac_material_id  # Kullanıcının seçtiği Saç kalınlığı
-    mdf_id = req.mdf_material_id  # Kullanıcının seçtiği MDF
-
-    # Auto-calc material IDs set: skip from manual copy
-    auto_ids = {strafor_id, boya_id, sac_id, mdf_id} - {None}
-
-    manual_material_assignments: list[tuple[int, float]] = []
-    for mat_id_raw, quantity_raw in (req.materials or {}).items():
-        try:
-            mat_id = int(mat_id_raw)
-            quantity = float(quantity_raw)
-        except (TypeError, ValueError):
-            continue
-        # Otomatik hesaplanan materyalleri manuel kalemlerden ayır
-        if mat_id in auto_ids:
-            continue
-        manual_material_assignments.append((mat_id, quantity))
-
-    inherit_detail_limit = max(0, int(os.getenv("INHERIT_RESPONSE_DETAIL_LIMIT", "250")))
-    updated_children_count = 0
-    skipped_children_count = 0
-    updated_children_sample: list[dict] = []
-    skipped_children_sample: list[dict] = []
-    product_updates: list[tuple] = []
-    material_upserts: list[tuple] = []
-    cost_upserts: list[tuple] = []
-
-    kaplama_name_map_exact: dict[str, list[str]] = {}
-    kaplama_name_map_ci: dict[str, list[str]] = {}
-    for k, v in (req.kaplama_name_map or {}).items():
-        key = str(k).strip()
-        if not key:
-            continue
-        names = normalize_cost_name_list(v, canonicalize_kaplama=True)
-        if not names:
-            continue
-        kaplama_name_map_exact[key] = names
-        kaplama_name_map_ci[key.lower()] = names
-
-    kaplama_map_by_size: dict[str, list[str]] = {}
-    for k, v in (req.kaplama_map or {}).items():
-        key = str(k).strip()
-        if not key:
-            continue
-        names = normalize_cost_name_list(v, canonicalize_kaplama=True)
-        if not names:
-            continue
-        kaplama_map_by_size[key] = names
-
-    kaplama_fallback_from_cost_map: dict[str, list[str]] = {}
-    for k, v in (req.cost_map or {}).items():
-        key = str(k).strip()
-        if not key:
-            continue
-        names = normalize_cost_name_list(v, canonicalize_kaplama=True)
-        if not names:
-            continue
-        kaplama_fallback_from_cost_map[key] = names
-
-    for child in children:
-        sku = child["child_sku"]
-        child_name = (child["child_name"] or "").strip()
-        variation_color = (child["variation_color"] or "").strip()
-        alan = child["alan_m2"]  # preserved per-child
-        size = child["variation_size"] or "(boyutsuz)"
-
-        # Resolve kargo cost_name for this child's size via cost_map
-        kargo_cost_name = req.cost_map.get(size)
-        if not kargo_cost_name:
-            # Try to find a fallback: if cost_map has a "*" / default key
-            kargo_cost_name = req.cost_map.get("*")
-        if not kargo_cost_name:
-            skipped_children_count += 1
-            if inherit_detail_limit > 0 and len(skipped_children_sample) < inherit_detail_limit:
-                skipped_children_sample.append({"child_sku": sku, "variation_size": size, "reason": "no kargo mapping"})
-            continue
-
-        # Resolve kaplama cost_name list:
-        # 1) child_name bazlı override (yeni)
-        # 2) variation_size bazlı map (geriye dönük)
-        # 3) cost_map fallback (eski davranış)
-        kaplama_cost_names: list[str] = []
-        if child_name:
-            lookup_keys = []
-            tier_key = build_kaplama_group_key(
-                child_name,
-                detect_kaplama_tier(child_name, variation_color),
-            )
-            if tier_key:
-                lookup_keys.append(tier_key)
-            if variation_color:
-                lookup_keys.append(f"{child_name}||{variation_color}")
-            lookup_keys.append(child_name)
-
-            seen_keys = set()
-            for lookup_key in lookup_keys:
-                normalized_lookup = lookup_key.strip()
-                if not normalized_lookup:
-                    continue
-                lowered_lookup = normalized_lookup.lower()
-                if lowered_lookup in seen_keys:
-                    continue
-                seen_keys.add(lowered_lookup)
-                kaplama_cost_names = kaplama_name_map_exact.get(normalized_lookup, [])
-                if not kaplama_cost_names:
-                    kaplama_cost_names = kaplama_name_map_ci.get(lowered_lookup, [])
-                if kaplama_cost_names:
-                    break
-        if not kaplama_cost_names:
-            if kaplama_map_by_size:
-                kaplama_source_map = kaplama_map_by_size
-            elif kaplama_name_map_exact:
-                kaplama_source_map = {}
-            else:
-                kaplama_source_map = kaplama_fallback_from_cost_map
-            kaplama_cost_names = kaplama_source_map.get(size, [])
-            if not kaplama_cost_names:
-                kaplama_cost_names = kaplama_source_map.get("*", [])
-        if not kaplama_cost_names:
-            if not bool(req.allow_missing_kaplama):
-                skipped_children_count += 1
-                if inherit_detail_limit > 0 and len(skipped_children_sample) < inherit_detail_limit:
-                    skipped_children_sample.append({"child_sku": sku, "variation_size": size, "reason": "no kaplama mapping"})
-                continue
-
-        # Resolve cargo weight for this child's size via weight_map
-        kargo_agirlik = req.weight_map.get(size)
-        if kargo_agirlik is None:
-            kargo_agirlik = req.weight_map.get("*")
-        if kargo_agirlik is None:
-            skipped_children_count += 1
-            if inherit_detail_limit > 0 and len(skipped_children_sample) < inherit_detail_limit:
-                skipped_children_sample.append({"child_sku": sku, "variation_size": size, "reason": "no weight mapping"})
-            continue
-        try:
-            kargo_agirlik = float(kargo_agirlik)
-        except (TypeError, ValueError):
-            skipped_children_count += 1
-            if inherit_detail_limit > 0 and len(skipped_children_sample) < inherit_detail_limit:
-                skipped_children_sample.append({"child_sku": sku, "variation_size": size, "reason": "invalid weight"})
-            continue
-        if kargo_agirlik < 0:
-            skipped_children_count += 1
-            if inherit_detail_limit > 0 and len(skipped_children_sample) < inherit_detail_limit:
-                skipped_children_sample.append({"child_sku": sku, "variation_size": size, "reason": "negative weight"})
-            continue
-
-        kargo_kodu = normalize_kargo_code(kargo_cost_name)
-        kargo_meta = kargo_lookup.get(kargo_kodu) if kargo_kodu else None
-        kargo_en = kargo_meta["kargo_en"] if kargo_meta else None
-        kargo_boy = kargo_meta["kargo_boy"] if kargo_meta else None
-        kargo_yukseklik = kargo_meta["kargo_yukseklik"] if kargo_meta else None
-        kargo_desi = calculate_kargo_desi(kargo_en, kargo_boy, kargo_yukseklik, kargo_agirlik)
-
-        rounded_agirlik = round(kargo_agirlik, 6)
-        product_updates.append((
-            kargo_kodu,
-            kargo_en,
-            kargo_boy,
-            kargo_yukseklik,
-            rounded_agirlik,
-            kargo_desi,
-            sku,
-        ))
-
-        # 1) Inherit base materials
-        for mat_id, quantity in manual_material_assignments:
-            material_upserts.append((sku, mat_id, quantity, quantity))
-
-        # 2) Flag kargo + kaplama cost categories for this size
-        assigned_costs = [kargo_cost_name, *kaplama_cost_names]
-        seen_assigned: set[str] = set()
-        for assigned_cost in assigned_costs:
-            assigned_cost = str(assigned_cost or "").strip()
-            if not assigned_cost:
-                continue
-            key = assigned_cost.casefold()
-            if key in seen_assigned:
-                continue
-            seen_assigned.add(key)
-            cost_upserts.append((sku, assigned_cost))
-
-        # 5-6) Auto-calculate area-driven materials
-        child_result = {
-            "child_sku": sku, "alan_m2": alan,
-            "variation_size": size,
-            "cost_name": kargo_cost_name,  # backward compatibility
-            "kargo_cost_name": kargo_cost_name,
-            "kaplama_cost_name": kaplama_cost_names[0] if kaplama_cost_names else None,
-            "kaplama_cost_names": kaplama_cost_names,
-            "kargo_kodu": kargo_kodu,
-            "kargo_en": kargo_en,
-            "kargo_boy": kargo_boy,
-            "kargo_yukseklik": kargo_yukseklik,
-            "kargo_agirlik": rounded_agirlik,
-            "kargo_desi": kargo_desi,
-            "strafor": None, "boya_iscilik": None, "sac": None, "mdf": None,
-        }
-
-        if alan is not None:
-            if strafor_id is not None:
-                strafor_qty = round(alan * 1.2, 6)
-                material_upserts.append((sku, strafor_id, strafor_qty, strafor_qty))
-                child_result["strafor"] = strafor_qty
-
-            if boya_id is not None:
-                boya_qty = round(alan * 5, 6)
-                material_upserts.append((sku, boya_id, boya_qty, boya_qty))
-                child_result["boya_iscilik"] = boya_qty
-
-            if sac_id is not None:
-                sac_qty = round(alan, 6)  # Saç = Alan
-                material_upserts.append((sku, sac_id, sac_qty, sac_qty))
-                child_result["sac"] = sac_qty
-
-            if mdf_id is not None:
-                mdf_qty = round(alan, 6)  # MDF = Alan
-                material_upserts.append((sku, mdf_id, mdf_qty, mdf_qty))
-                child_result["mdf"] = mdf_qty
-
-        updated_children_count += 1
-        if inherit_detail_limit > 0 and len(updated_children_sample) < inherit_detail_limit:
-            updated_children_sample.append(child_result)
-
-    if product_updates:
-        conn.executemany(
-            """
-            UPDATE products
-            SET kargo_kodu = ?,
-                kargo_en = ?,
-                kargo_boy = ?,
-                kargo_yukseklik = ?,
-                kargo_agirlik = ?,
-                kargo_desi = ?
-            WHERE child_sku = ?
-            """,
-            product_updates,
-        )
-
-    if material_upserts:
-        conn.executemany(
-            """
-            INSERT INTO product_materials (child_sku, material_id, quantity)
-            VALUES (?, ?, ?)
-            ON CONFLICT(child_sku, material_id) DO UPDATE SET quantity = ?
-            """,
-            material_upserts,
-        )
-
-    if cost_upserts:
-        conn.executemany(
-            """
-            INSERT INTO product_costs (child_sku, cost_name, assigned)
-            VALUES (?, ?, 1)
-            ON CONFLICT(child_sku, cost_name) DO UPDATE SET assigned = 1
-            """,
-            cost_upserts,
-        )
-
-    conn.commit()
+        raise
     conn.close()
+
+    metrics = core_result.pop("_metrics", {}) if isinstance(core_result, dict) else {}
+    updated_children_count = int(core_result.get("children_updated") or 0)
+    skipped_children_count = int(core_result.get("children_skipped") or 0)
+    product_updates_count = int(metrics.get("product_updates") or 0)
+    material_upserts_count = int(metrics.get("material_upserts") or 0)
+    cost_upserts_count = int(metrics.get("cost_upserts") or 0)
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
     logger.info(
         "[inherit.apply] parent=%s updated=%s skipped=%s product_updates=%s material_upserts=%s cost_upserts=%s duration_ms=%s",
         req.parent_name,
         updated_children_count,
         skipped_children_count,
-        len(product_updates),
-        len(material_upserts),
-        len(cost_upserts),
+        product_updates_count,
+        material_upserts_count,
+        cost_upserts_count,
         elapsed_ms,
     )
     write_audit_log(
@@ -3156,19 +3525,177 @@ def apply_parent_inheritance(req: ParentInheritanceRequest, request: Request):
         except Exception:
             pass
 
+    return core_result
+
+
+@app.post("/api/parent-cost-groups/{group_id}/apply-inheritance-atomic")
+def apply_parent_cost_group_inheritance_atomic(
+    group_id: int,
+    data: ParentCostGroupInheritanceApplyRequest,
+    request: Request,
+):
+    started_at = time.perf_counter()
+    user = require_request_user(request)
+
+    if ENABLE_APPROVAL_WORKFLOW and user.get("role") != "admin":
+        raise HTTPException(
+            status_code=409,
+            detail="Onay workflow aktifken grup atomik uygulama yalnızca admin kullanıcı tarafından çalıştırılabilir.",
+        )
+
+    conn = get_db()
+    active_parent_name: str | None = None
+    group_name = ""
+
+    try:
+        group_row = conn.execute(
+            "SELECT id, name, is_active FROM parent_cost_groups WHERE id = ?",
+            (group_id,),
+        ).fetchone()
+        if not group_row:
+            raise HTTPException(status_code=404, detail="Parent grubu bulunamadı")
+        if int(group_row["is_active"] or 0) != 1:
+            raise HTTPException(status_code=409, detail="Pasif parent grubuna atomik uygulama yapılamaz")
+
+        group_name = str(group_row["name"] or "").strip()
+        item_rows = conn.execute(
+            """
+            SELECT parent_name
+            FROM parent_cost_group_items
+            WHERE group_id = ?
+            ORDER BY parent_name
+            """,
+            (group_id,),
+        ).fetchall()
+
+        parent_names: list[str] = []
+        seen_parent_names: set[str] = set()
+        for row in item_rows:
+            name = str(row["parent_name"] or "").strip()
+            if not name:
+                continue
+            key = name.casefold()
+            if key in seen_parent_names:
+                continue
+            seen_parent_names.add(key)
+            parent_names.append(name)
+
+        if not parent_names:
+            raise HTTPException(status_code=400, detail="Bu parent grubunda uygulanacak parent yok")
+
+        selected_parent_name = str(data.selected_parent_name or "").strip() or None
+        kargo_lookup = load_kargo_lookup()
+        parents_summary: list[dict] = []
+        total_children_updated = 0
+        total_children_skipped = 0
+        total_product_updates = 0
+        total_material_upserts = 0
+        total_cost_upserts = 0
+        selected_parent_result: dict | None = None
+        fallback_parent_result: dict | None = None
+
+        for parent_name in parent_names:
+            active_parent_name = parent_name
+            req = ParentInheritanceRequest(
+                parent_name=parent_name,
+                cost_map=data.cost_map,
+                kaplama_map=data.kaplama_map,
+                kaplama_name_map=data.kaplama_name_map,
+                allow_missing_kaplama=bool(data.allow_missing_kaplama),
+                weight_map=data.weight_map,
+                materials=data.materials,
+                sac_material_id=data.sac_material_id,
+                mdf_material_id=data.mdf_material_id,
+            )
+            parent_result = _apply_parent_inheritance_core(conn, req, kargo_lookup=kargo_lookup)
+            metrics = parent_result.pop("_metrics", {}) if isinstance(parent_result, dict) else {}
+            children_updated = int(parent_result.get("children_updated") or 0)
+            children_skipped = int(parent_result.get("children_skipped") or 0)
+
+            total_children_updated += children_updated
+            total_children_skipped += children_skipped
+            total_product_updates += int(metrics.get("product_updates") or 0)
+            total_material_upserts += int(metrics.get("material_upserts") or 0)
+            total_cost_upserts += int(metrics.get("cost_upserts") or 0)
+
+            parents_summary.append(
+                {
+                    "parent_name": parent_name,
+                    "children_updated": children_updated,
+                    "children_skipped": children_skipped,
+                    "details_truncated": int(parent_result.get("details_truncated") or 0),
+                    "skipped_truncated": int(parent_result.get("skipped_truncated") or 0),
+                }
+            )
+
+            if fallback_parent_result is None:
+                fallback_parent_result = parent_result
+            if selected_parent_name and parent_name.casefold() == selected_parent_name.casefold():
+                selected_parent_result = parent_result
+
+        conn.commit()
+    except HTTPException as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        if active_parent_name:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=f"Parent '{active_parent_name}' başarısız oldu: {exc.detail}. Tüm değişiklikler geri alındı.",
+            )
+        raise
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.exception("[inherit.group_atomic] apply failed group_id=%s", group_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Atomik grup uygulaması başarısız oldu, tüm değişiklikler geri alındı: {exc}",
+        )
+    finally:
+        conn.close()
+
+    selected_parent_result = selected_parent_result or fallback_parent_result
+    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    logger.info(
+        "[inherit.group_atomic] group_id=%s parents=%s updated=%s skipped=%s product_updates=%s material_upserts=%s cost_upserts=%s duration_ms=%s",
+        group_id,
+        len(parents_summary),
+        total_children_updated,
+        total_children_skipped,
+        total_product_updates,
+        total_material_upserts,
+        total_cost_upserts,
+        elapsed_ms,
+    )
+    write_audit_log(
+        user,
+        "inherit.group_atomic_apply",
+        target=f"{group_id}:{group_name}",
+        details={
+            "group_id": int(group_id),
+            "group_name": group_name,
+            "parents_total": len(parents_summary),
+            "total_children_updated": total_children_updated,
+            "total_children_skipped": total_children_skipped,
+            "allow_missing_kaplama": bool(data.allow_missing_kaplama),
+            "duration_ms": elapsed_ms,
+        },
+    )
+
     return {
         "status": "ok",
-        "parent": req.parent_name,
-        "cost_map": req.cost_map,
-        "kaplama_map": req.kaplama_map,
-        "kaplama_name_map": req.kaplama_name_map,
-        "allow_missing_kaplama": bool(req.allow_missing_kaplama),
-        "children_updated": updated_children_count,
-        "children_skipped": skipped_children_count,
-        "details": updated_children_sample,
-        "details_truncated": max(0, updated_children_count - len(updated_children_sample)),
-        "skipped": skipped_children_sample,
-        "skipped_truncated": max(0, skipped_children_count - len(skipped_children_sample)),
+        "mode": "group_atomic",
+        "group_id": int(group_id),
+        "group_name": group_name,
+        "parents_total": len(parents_summary),
+        "total_children_updated": total_children_updated,
+        "total_children_skipped": total_children_skipped,
+        "parents": parents_summary,
+        "selected_parent_result": selected_parent_result,
     }
 
 
@@ -3327,6 +3854,87 @@ def export_all(request: Request):
 def template_structure():
     """Şablonun kolon yapısını döndürür."""
     return get_template_structure()
+
+
+@app.post("/api/template/sync")
+def sync_template_data(
+    request: Request,
+    force_refresh: bool = Query(False),
+    sync_materials: bool = Query(True),
+    sync_costs: bool = Query(True),
+):
+    """
+    Şablondan maliyet/hammadde tanımlarını veri kaybı olmadan senkronize eder.
+    force_refresh=true ise TEMPLATE_URL cache'i invalid edilir.
+    """
+    admin = require_admin_user(request)
+    if not sync_materials and not sync_costs:
+        raise HTTPException(status_code=400, detail="En az bir sync tipi seçilmelidir")
+
+    template_url = os.getenv("TEMPLATE_URL", "").strip()
+    cache_invalidated = False
+    if force_refresh and template_url and is_http_url(template_url):
+        cache_invalidated = invalidate_remote_cache(template_url, cache_name="template.xlsx")
+
+    template_path = resolve_template_path()
+    if not template_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Şablon dosyası bulunamadı: {template_path}",
+        )
+
+    conn = get_db()
+    before_materials = row_first_value(conn.execute("SELECT COUNT(*) FROM raw_materials").fetchone()) or 0
+    before_cost_defs = row_first_value(conn.execute("SELECT COUNT(*) FROM cost_definitions").fetchone()) or 0
+    conn.close()
+
+    added_cost_defs = 0
+    added_materials = 0
+    normalized_legacy = 0
+    deactivated_shadowed = 0
+
+    if sync_materials:
+        added_materials = int(load_default_materials() or 0)
+
+    if sync_costs:
+        added_cost_defs = int(sync_cost_definitions_from_template() or 0)
+        normalized_legacy = int(normalize_legacy_gold_silver_names() or 0)
+        deactivated_shadowed = int(deactivate_shadowed_kaplama_base_names() or 0)
+
+    conn = get_db()
+    after_materials = row_first_value(conn.execute("SELECT COUNT(*) FROM raw_materials").fetchone()) or 0
+    after_cost_defs = row_first_value(conn.execute("SELECT COUNT(*) FROM cost_definitions").fetchone()) or 0
+    conn.close()
+
+    materials_added = int(after_materials - before_materials)
+    cost_defs_added = int(after_cost_defs - before_cost_defs)
+
+    response = {
+        "status": "ok",
+        "template_path": str(template_path),
+        "force_refresh": bool(force_refresh),
+        "cache_invalidated": bool(cache_invalidated),
+        "sync_materials": bool(sync_materials),
+        "sync_costs": bool(sync_costs),
+        "materials_before": int(before_materials),
+        "materials_after": int(after_materials),
+        "materials_added": materials_added,
+        "materials_inserted_from_template": added_materials,
+        "cost_definitions_before": int(before_cost_defs),
+        "cost_definitions_after": int(after_cost_defs),
+        "cost_definitions_added": cost_defs_added,
+        "cost_definitions_inserted_from_template": added_cost_defs,
+        "legacy_names_normalized": normalized_legacy,
+        "shadowed_base_names_deactivated": deactivated_shadowed,
+    }
+
+    write_audit_log(
+        admin,
+        "template.sync",
+        target=str(template_path),
+        details=response,
+    )
+    return response
 
 
 # ─────────────────────────── DB MANAGEMENT ───────────────────────────

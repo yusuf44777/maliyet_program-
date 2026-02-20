@@ -2,14 +2,17 @@ import { useState, useEffect, useMemo, useCallback } from 'react';
 import {
   getProductGroups, getProducts, getMaterials, getCostDefinitions,
   getKargoOptions, getKaplamaNameSuggestions, applyInheritance, exportExcel, getInheritancePrefill,
+  getParentCostGroups, createParentCostGroup, deleteParentCostGroup,
+  addParentCostGroupItems, removeParentCostGroupItems, applyParentCostGroupInheritanceAtomic,
 } from '../api';
 import { CATEGORY_OPTIONS, getCategoryBadgeClass } from '../categoryUtils';
 import toast from 'react-hot-toast';
 import {
   Search, ChevronDown, ChevronRight, GitBranch, Hammer,
   Package, Zap, Download, CheckCircle2, AlertTriangle,
-  ArrowRight, Loader2, Ruler, Box,
+  ArrowRight, Loader2, Ruler, Box, Users, Plus, Trash2, Filter,
 } from 'lucide-react';
+import HelpTip from './HelpTip';
 
 const KAPLAMA_TOKEN_PATTERN = /[a-z0-9çğıöşü]+/gi;
 const KAPLAMA_SILVER_TOKENS = new Set(['silver', 'gumus', 'gümüş', 'gümus']);
@@ -128,6 +131,16 @@ export default function ParentInheritance({ onRefresh }) {
     total_pages: 0,
     page_size: 50,
   });
+  const [parentCostGroups, setParentCostGroups] = useState([]);
+  const [parentCostGroupsLoading, setParentCostGroupsLoading] = useState(false);
+  const [selectedParentCostGroupId, setSelectedParentCostGroupId] = useState(null);
+  const [newParentCostGroupName, setNewParentCostGroupName] = useState('');
+  const [newParentCostGroupDescription, setNewParentCostGroupDescription] = useState('');
+  const [creatingParentCostGroup, setCreatingParentCostGroup] = useState(false);
+  const [groupItemSaving, setGroupItemSaving] = useState(false);
+  const [showOnlySelectedParentCostGroup, setShowOnlySelectedParentCostGroup] = useState(false);
+  const [applyToParentGroup, setApplyToParentGroup] = useState(false);
+  const [groupApplyResult, setGroupApplyResult] = useState(null);
 
   // ─── State ───
   const [loading, setLoading] = useState(false);
@@ -147,6 +160,28 @@ export default function ParentInheritance({ onRefresh }) {
       setKargoOptionsRaw(k || []);
     }).catch(err => toast.error('Veri yüklenemedi'));
   }, []);
+
+  const fetchParentCostGroups = useCallback(async () => {
+    setParentCostGroupsLoading(true);
+    try {
+      const data = await getParentCostGroups({ include_items: true, active_only: true });
+      const nextGroups = Array.isArray(data) ? data : [];
+      setParentCostGroups(nextGroups);
+      setSelectedParentCostGroupId((prev) => {
+        if (prev == null) return prev;
+        const exists = nextGroups.some(g => Number(g.id) === Number(prev));
+        return exists ? prev : null;
+      });
+    } catch (err) {
+      toast.error('Parent maliyet grupları yüklenemedi');
+    } finally {
+      setParentCostGroupsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchParentCostGroups();
+  }, [fetchParentCostGroups]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -196,6 +231,39 @@ export default function ParentInheritance({ onRefresh }) {
     setExpandedGroup(null);
   }, [groupPagination.page]);
 
+  const selectedParentCostGroup = useMemo(
+    () => parentCostGroups.find(g => Number(g.id) === Number(selectedParentCostGroupId)) || null,
+    [parentCostGroups, selectedParentCostGroupId]
+  );
+
+  const selectedParentCostGroupItemSet = useMemo(() => {
+    const items = selectedParentCostGroup?.items || [];
+    const set = new Set();
+    for (const item of items) {
+      const key = String(item?.parent_name || '').trim().toLocaleLowerCase('tr');
+      if (key) set.add(key);
+    }
+    return set;
+  }, [selectedParentCostGroup]);
+
+  useEffect(() => {
+    if (!selectedParentCostGroup || selectedParentCostGroupItemSet.size === 0) {
+      setApplyToParentGroup(false);
+      if (!selectedParentCostGroup) {
+        setShowOnlySelectedParentCostGroup(false);
+      }
+    }
+  }, [selectedParentCostGroup, selectedParentCostGroupItemSet]);
+
+  const visibleGroups = useMemo(() => {
+    if (!showOnlySelectedParentCostGroup) return groups;
+    if (!selectedParentCostGroup || selectedParentCostGroupItemSet.size === 0) return [];
+    return groups.filter((g) => {
+      const key = String(g?.parent_name || '').trim().toLocaleLowerCase('tr');
+      return selectedParentCostGroupItemSet.has(key);
+    });
+  }, [groups, showOnlySelectedParentCostGroup, selectedParentCostGroup, selectedParentCostGroupItemSet]);
+
   // ─── Load children when group selected ───
   useEffect(() => {
     if (!selectedGroup) { setChildren([]); return; }
@@ -212,6 +280,7 @@ export default function ParentInheritance({ onRefresh }) {
 
     // Yeni parent seçildiğinde önce local state'i temizle, sonra prefill uygula.
     setResult(null);
+    setGroupApplyResult(null);
     setCostMap({});
     setKaplamaMap({});
     setKaplamaNameMap({});
@@ -678,6 +747,138 @@ export default function ParentInheritance({ onRefresh }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedGroup, nameGroups, kaplamaSuggestionByName]);
 
+  const handleCreateParentCostGroup = async () => {
+    const name = newParentCostGroupName.trim();
+    if (!name) {
+      toast.error('Grup adı boş olamaz');
+      return;
+    }
+    setCreatingParentCostGroup(true);
+    try {
+      const created = await createParentCostGroup({
+        name,
+        description: newParentCostGroupDescription.trim() || undefined,
+      });
+      setNewParentCostGroupName('');
+      setNewParentCostGroupDescription('');
+      await fetchParentCostGroups();
+      if (created?.id != null) {
+        setSelectedParentCostGroupId(Number(created.id));
+      }
+      toast.success('Parent maliyet grubu oluşturuldu');
+    } catch (err) {
+      toast.error('Grup oluşturulamadı: ' + (err.response?.data?.detail || err.message));
+    } finally {
+      setCreatingParentCostGroup(false);
+    }
+  };
+
+  const handleDeleteParentCostGroup = async () => {
+    if (!selectedParentCostGroup?.id) {
+      toast.error('Önce bir grup seçin');
+      return;
+    }
+    const confirmed = window.confirm(
+      `"${selectedParentCostGroup.name}" grubu silinsin mi? Bu gruptaki parent üyeleri de silinir.`,
+    );
+    if (!confirmed) return;
+
+    setGroupItemSaving(true);
+    try {
+      await deleteParentCostGroup(selectedParentCostGroup.id);
+      setSelectedParentCostGroupId(null);
+      setApplyToParentGroup(false);
+      setShowOnlySelectedParentCostGroup(false);
+      await fetchParentCostGroups();
+      toast.success('Parent maliyet grubu silindi');
+    } catch (err) {
+      toast.error('Grup silinemedi: ' + (err.response?.data?.detail || err.message));
+    } finally {
+      setGroupItemSaving(false);
+    }
+  };
+
+  const handleAddParentToSelectedCostGroup = async (group) => {
+    const targetGroup = group || selectedGroup;
+    if (!selectedParentCostGroup?.id) {
+      toast.error('Önce bir maliyet grubu seçin');
+      return;
+    }
+    if (!targetGroup?.parent_name) {
+      toast.error('Eklenecek parent bulunamadı');
+      return;
+    }
+    const parentKey = String(targetGroup.parent_name || '').trim().toLocaleLowerCase('tr');
+    if (selectedParentCostGroupItemSet.has(parentKey)) {
+      toast('Bu parent zaten grupta');
+      return;
+    }
+
+    setGroupItemSaving(true);
+    try {
+      const res = await addParentCostGroupItems(selectedParentCostGroup.id, {
+        parents: [{ parent_name: targetGroup.parent_name, kategori: targetGroup.kategori || undefined }],
+      });
+      if (Array.isArray(res?.missing_parents) && res.missing_parents.length > 0) {
+        toast.error(`Eklenemedi: ${res.missing_parents.join(', ')}`);
+      } else {
+        toast.success('Parent gruba eklendi');
+      }
+      await fetchParentCostGroups();
+    } catch (err) {
+      toast.error('Parent gruba eklenemedi: ' + (err.response?.data?.detail || err.message));
+    } finally {
+      setGroupItemSaving(false);
+    }
+  };
+
+  const handleRemoveParentFromSelectedCostGroup = async (parentName) => {
+    const cleanParentName = String(parentName || '').trim();
+    if (!selectedParentCostGroup?.id || !cleanParentName) return;
+
+    setGroupItemSaving(true);
+    try {
+      await removeParentCostGroupItems(selectedParentCostGroup.id, {
+        parents: [{ parent_name: cleanParentName }],
+      });
+      await fetchParentCostGroups();
+      toast.success('Parent gruptan çıkarıldı');
+    } catch (err) {
+      toast.error('Parent gruptan çıkarılamadı: ' + (err.response?.data?.detail || err.message));
+    } finally {
+      setGroupItemSaving(false);
+    }
+  };
+
+  const buildApplyPayload = () => {
+    const cleanWeightMap = {};
+    for (const sg of sizeGroups) {
+      const val = parseFloat(weightMap[sg.size]);
+      if (!Number.isNaN(val) && val >= 0) {
+        cleanWeightMap[sg.size] = val;
+      }
+    }
+
+    const cleanKaplamaNameMap = {};
+    for (const ng of nameGroups) {
+      const selected = normalizeKaplamaSelection(kaplamaNameMap[ng.key]);
+      if (selected.length > 0) {
+        cleanKaplamaNameMap[ng.key] = selected;
+      }
+    }
+
+    return {
+      cost_map: costMap,
+      kaplama_map: kaplamaMap,
+      kaplama_name_map: cleanKaplamaNameMap,
+      allow_missing_kaplama: allowMissingKaplama,
+      weight_map: cleanWeightMap,
+      materials: materialInputs,
+      sac_material_id: selectedSac || undefined,
+      mdf_material_id: selectedMdf || undefined,
+    };
+  };
+
   const handleApply = async () => {
     if (!selectedGroup) {
       toast.error('Önce bir parent seçin');
@@ -699,44 +900,78 @@ export default function ParentInheritance({ onRefresh }) {
       toast.error(`Eksik alanlar var: ${reasons.join(', ')}`);
       return;
     }
+
+    const selectedGroupParents = Array.isArray(selectedParentCostGroup?.items)
+      ? selectedParentCostGroup.items
+          .map(item => String(item?.parent_name || '').trim())
+          .filter(Boolean)
+      : [];
+    const dedupedGroupParents = [];
+    const dedupedGroupParentKeys = new Set();
+    for (const parentName of selectedGroupParents) {
+      const key = parentName.toLocaleLowerCase('tr');
+      if (dedupedGroupParentKeys.has(key)) continue;
+      dedupedGroupParentKeys.add(key);
+      dedupedGroupParents.push(parentName);
+    }
+    const targetParents = applyToParentGroup
+      ? dedupedGroupParents
+      : [selectedGroup.parent_name];
+
+    if (targetParents.length === 0) {
+      toast.error('Uygulanacak parent bulunamadı');
+      return;
+    }
+
     setLoading(true);
     setResult(null);
+    setGroupApplyResult(null);
     try {
-      const cleanWeightMap = {};
-      for (const sg of sizeGroups) {
-        const val = parseFloat(weightMap[sg.size]);
-        if (!Number.isNaN(val) && val >= 0) {
-          cleanWeightMap[sg.size] = val;
+      const basePayload = buildApplyPayload();
+
+      if (!applyToParentGroup) {
+        const res = await applyInheritance({
+          parent_name: selectedGroup.parent_name,
+          ...basePayload,
+        });
+        setResult(res);
+        toast.success(`${res.children_updated} child güncellendi${res.children_skipped > 0 ? `, ${res.children_skipped} atlandı` : ''}`);
+      } else {
+        if (!selectedParentCostGroup?.id) {
+          throw new Error('Seçili parent maliyet grubu bulunamadı');
         }
+        const groupRes = await applyParentCostGroupInheritanceAtomic(selectedParentCostGroup.id, {
+          ...basePayload,
+          selected_parent_name: selectedGroup.parent_name,
+        });
+
+        const summary = {
+          target_count: Number(groupRes?.parents_total || targetParents.length),
+          success_count: Number(groupRes?.parents_total || 0),
+          failure_count: 0,
+          total_children_updated: Number(groupRes?.total_children_updated || 0),
+          total_children_skipped: Number(groupRes?.total_children_skipped || 0),
+          results: Array.isArray(groupRes?.parents)
+            ? groupRes.parents.map((row) => ({
+                parent_name: row.parent_name,
+                children_updated: Number(row.children_updated || 0),
+                children_skipped: Number(row.children_skipped || 0),
+              }))
+            : [],
+          failures: [],
+        };
+
+        setGroupApplyResult(summary);
+        setResult(groupRes?.selected_parent_result || null);
+        toast.success(`${summary.success_count} parent atomik uygulandı (${summary.total_children_updated} child)`);
       }
 
-      const cleanKaplamaNameMap = {};
-      for (const ng of nameGroups) {
-        const selected = normalizeKaplamaSelection(kaplamaNameMap[ng.key]);
-        if (selected.length > 0) {
-          cleanKaplamaNameMap[ng.key] = selected;
-        }
-      }
-
-      const res = await applyInheritance({
-        parent_name: selectedGroup.parent_name,
-        cost_map: costMap,
-        kaplama_map: kaplamaMap,
-        kaplama_name_map: cleanKaplamaNameMap,
-        allow_missing_kaplama: allowMissingKaplama,
-        weight_map: cleanWeightMap,
-        materials: materialInputs,
-        sac_material_id: selectedSac || undefined,
-        mdf_material_id: selectedMdf || undefined,
-      });
-      setResult(res);
-      toast.success(`${res.children_updated} child güncellendi${res.children_skipped > 0 ? `, ${res.children_skipped} atlandı` : ''}`);
       onRefresh();
       const data = await getProducts({
         parent_name: selectedGroup.parent_name,
         page_size: 500,
       });
-      setChildren(data.products);
+      setChildren(data.products || []);
     } catch (err) {
       toast.error('Uygulama hatası: ' + (err.response?.data?.detail || err.message));
     }
@@ -770,6 +1005,10 @@ export default function ParentInheritance({ onRefresh }) {
           <div className="flex items-center gap-2">
             <GitBranch className="w-5 h-5 text-indigo-600" />
             <h3 className="font-semibold text-gray-900">1. Parent Seçimi</h3>
+            <HelpTip
+              title="Parent seçimi neden önemli?"
+              text="Bu adımda seçtiğiniz parent, maliyet aktarımının kaynak ürünü olur. Yanlış parent seçilirse child ürünler yanlış güncellenir."
+            />
           </div>
           <div className="flex gap-2">
             <select
@@ -817,6 +1056,138 @@ export default function ParentInheritance({ onRefresh }) {
           </div>
         </div>
 
+        <div className="mb-4 rounded-lg border border-blue-200 bg-blue-50/60 p-3.5">
+          <div className="flex items-center gap-2 mb-2">
+            <Users className="w-4 h-4 text-blue-700" />
+            <h4 className="text-sm font-semibold text-blue-900">Parent Maliyet Grupları</h4>
+            <HelpTip
+              title="Grup ne işe yarar?"
+              text="Maliyeti aynı olan parentları bir grupta tutarak aynı ayarı tek seferde tümüne uygulayabilirsiniz."
+              placement="bottom"
+            />
+            {parentCostGroupsLoading && (
+              <Loader2 className="w-3.5 h-3.5 text-blue-500 animate-spin" />
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-2 mb-2.5">
+            <div className="lg:col-span-4">
+              <select
+                value={selectedParentCostGroupId || ''}
+                onChange={(e) => {
+                  const next = e.target.value ? Number(e.target.value) : null;
+                  setSelectedParentCostGroupId(next);
+                  if (!e.target.value) {
+                    setShowOnlySelectedParentCostGroup(false);
+                    setApplyToParentGroup(false);
+                  }
+                }}
+                className="w-full px-3 py-2 border border-blue-200 rounded-lg text-sm bg-white"
+              >
+                <option value="">Maliyet grubu seç...</option>
+                {parentCostGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name} ({g.parent_count || 0} parent)
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="lg:col-span-3">
+              <input
+                type="text"
+                value={newParentCostGroupName}
+                onChange={(e) => setNewParentCostGroupName(e.target.value)}
+                placeholder="Yeni grup adı"
+                className="w-full px-3 py-2 border border-blue-200 rounded-lg text-sm bg-white"
+              />
+            </div>
+            <div className="lg:col-span-3">
+              <input
+                type="text"
+                value={newParentCostGroupDescription}
+                onChange={(e) => setNewParentCostGroupDescription(e.target.value)}
+                placeholder="Açıklama (opsiyonel)"
+                className="w-full px-3 py-2 border border-blue-200 rounded-lg text-sm bg-white"
+              />
+            </div>
+            <div className="lg:col-span-2 flex gap-2">
+              <button
+                type="button"
+                onClick={handleCreateParentCostGroup}
+                disabled={creatingParentCostGroup || !newParentCostGroupName.trim()}
+                className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-blue-600 text-white text-sm disabled:opacity-50"
+              >
+                {creatingParentCostGroup ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+                Oluştur
+              </button>
+              <button
+                type="button"
+                onClick={handleDeleteParentCostGroup}
+                disabled={!selectedParentCostGroup || groupItemSaving}
+                className="px-3 py-2 rounded-lg border border-red-200 text-red-700 text-sm hover:bg-red-50 disabled:opacity-50"
+                title="Seçili maliyet grubunu sil"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {selectedParentCostGroup && (
+            <>
+              <div className="flex items-center gap-2 mb-2">
+                <button
+                  type="button"
+                  onClick={() => handleAddParentToSelectedCostGroup(selectedGroup)}
+                  disabled={!selectedGroup?.parent_name || groupItemSaving}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border border-blue-200 text-blue-700 text-xs hover:bg-blue-100 disabled:opacity-50"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  Seçili Parentı Gruba Ekle
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowOnlySelectedParentCostGroup((prev) => !prev)}
+                  disabled={!selectedParentCostGroup || selectedParentCostGroupItemSet.size === 0}
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border text-xs disabled:opacity-50 ${
+                    showOnlySelectedParentCostGroup
+                      ? 'border-blue-300 bg-blue-100 text-blue-800'
+                      : 'border-blue-200 text-blue-700 hover:bg-blue-100'
+                  }`}
+                >
+                  <Filter className="w-3.5 h-3.5" />
+                  Listede Sadece Bu Grup
+                </button>
+                <span className="text-xs text-blue-800">
+                  {selectedParentCostGroup.name}: {selectedParentCostGroupItemSet.size} parent
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {(selectedParentCostGroup.items || []).length === 0 ? (
+                  <span className="text-xs text-blue-600">Bu grupta henüz parent yok.</span>
+                ) : (
+                  (selectedParentCostGroup.items || []).map((item) => (
+                    <span
+                      key={`${selectedParentCostGroup.id}-${item.parent_name}`}
+                      className="inline-flex items-center gap-1.5 px-2 py-1 rounded bg-white border border-blue-200 text-xs text-blue-900"
+                    >
+                      <span className="truncate max-w-[260px]" title={item.parent_name}>{item.parent_name}</span>
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveParentFromSelectedCostGroup(item.parent_name)}
+                        disabled={groupItemSaving}
+                        className="text-blue-500 hover:text-red-600 disabled:opacity-50"
+                        title="Gruptan çıkar"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </span>
+                  ))
+                )}
+              </div>
+            </>
+          )}
+        </div>
+
         {/* Selected parent badge */}
         {selectedGroup && (
           <div className="mb-3 flex items-center gap-3 p-3 bg-indigo-50 rounded-lg border border-indigo-200">
@@ -829,6 +1200,7 @@ export default function ParentInheritance({ onRefresh }) {
               onClick={() => {
                 setSelectedGroup(null);
                 setResult(null);
+                setGroupApplyResult(null);
                 setMaterialInputs({});
                 setCostMap({});
                 setKaplamaMap({});
@@ -837,6 +1209,7 @@ export default function ParentInheritance({ onRefresh }) {
                 setSelectedSac(null);
                 setSelectedMdf(null);
                 setAllowMissingKaplama(false);
+                setApplyToParentGroup(false);
               }}
               className="text-indigo-400 hover:text-indigo-700 text-sm"
             >Değiştir</button>
@@ -848,9 +1221,9 @@ export default function ParentInheritance({ onRefresh }) {
           <div className="border border-gray-100 rounded-lg divide-y divide-gray-100">
             {groupsLoading ? (
               <div className="p-6 text-center text-gray-400 text-sm">Yükleniyor...</div>
-            ) : groups.length === 0 ? (
+            ) : visibleGroups.length === 0 ? (
               <div className="p-6 text-center text-gray-400 text-sm">Sonuç bulunamadı</div>
-            ) : groups.map(g => (
+            ) : visibleGroups.map(g => (
               <div key={`${g.parent_name}-${g.kategori}`}>
                 <button
                   className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-gray-50 transition-colors"
@@ -893,13 +1266,24 @@ export default function ParentInheritance({ onRefresh }) {
                     >
                       Bu Parent'ı Seç
                     </button>
+                    {selectedParentCostGroup && (
+                      <button
+                        onClick={() => handleAddParentToSelectedCostGroup(g)}
+                        disabled={groupItemSaving}
+                        className="px-3 py-1 bg-blue-600 text-white rounded text-xs hover:bg-blue-700 disabled:opacity-50"
+                      >
+                        Gruba Ekle
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
             ))}
             <div className="flex items-center justify-between px-4 py-3 bg-gray-50">
               <span className="text-xs text-gray-500">
-                Toplam {groupPagination.total.toLocaleString()} parent
+                {showOnlySelectedParentCostGroup
+                  ? `${visibleGroups.length.toLocaleString()} / ${groupPagination.total.toLocaleString()} parent`
+                  : `Toplam ${groupPagination.total.toLocaleString()} parent`}
               </span>
               <div className="flex items-center gap-2">
                 <button
@@ -937,6 +1321,10 @@ export default function ParentInheritance({ onRefresh }) {
             <div className="flex items-center gap-2 mb-4">
               <Hammer className="w-5 h-5 text-green-600" />
               <h3 className="font-semibold text-gray-900">2. Hammadde Değerleri</h3>
+              <HelpTip
+                title="Bu alanlar neden var?"
+                text="Hammadde değerleri child ürünlere kopyalanır. Strafor, boya, saç ve MDF gibi alan bazlı kalemler otomatik hesaplanır."
+              />
             </div>
 
             <div className="mb-3 p-2.5 bg-amber-50 rounded-lg border border-amber-200 text-xs text-amber-700 flex items-start gap-2">
@@ -1050,6 +1438,10 @@ export default function ParentInheritance({ onRefresh }) {
             <div className="flex items-center gap-2">
               <Box className="w-5 h-5 text-orange-600" />
               <h3 className="font-semibold text-gray-900">Boyut → Kargo</h3>
+              <HelpTip
+                title="Boyut-kargo eşlemesi"
+                text="Her boyut grubu için doğru kargo maliyeti ve ağırlığı girilmelidir; desi ve gönderi maliyeti bu bilgiyle hesaplanır."
+              />
               <button
                 type="button"
                 onClick={resetKargoSelections}
@@ -1190,6 +1582,10 @@ export default function ParentInheritance({ onRefresh }) {
           <div className="flex items-center gap-2 mb-3">
             <Package className="w-5 h-5 text-emerald-600" />
             <h3 className="font-semibold text-gray-900">Ürün Adı + Renk → Kaplama</h3>
+            <HelpTip
+              title="Kaplama eşlemesi neden gerekli?"
+              text="Kaplama maliyeti child ürünün isim/renk kombinasyonuna göre belirlenir. Boş kalırsa ürün atlanabilir."
+            />
             <span className="text-[11px] text-gray-500">{nameGroups.length} grup</span>
             <button
               type="button"
@@ -1336,8 +1732,28 @@ export default function ParentInheritance({ onRefresh }) {
             <div className="flex items-center gap-2">
               <Zap className="w-5 h-5 text-purple-600" />
               <h3 className="font-semibold text-gray-900">3. Uygula</h3>
+              <HelpTip
+                title="Uygula butonu ne yapar?"
+                text="Girilen maliyet ve hammadde ayarlarını parent ve bağlı child ürünlere yazar. Grup modu açıksa tüm grup parentları için çalışır."
+              />
             </div>
             <div className="flex gap-2">
+              {selectedParentCostGroup && selectedParentCostGroupItemSet.size > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setApplyToParentGroup(prev => !prev)}
+                  className={`px-3 py-2 rounded-lg text-xs border ${
+                    applyToParentGroup
+                      ? 'border-purple-300 bg-purple-50 text-purple-800'
+                      : 'border-gray-200 text-gray-600 hover:bg-gray-50'
+                  }`}
+                  title="Aynı maliyet payload'ını seçili parent maliyet grubundaki tüm parentlara uygular"
+                >
+                  {applyToParentGroup
+                    ? `Grup Modu Açık (${selectedParentCostGroupItemSet.size} parent)`
+                    : 'Grup Modu Kapalı'}
+                </button>
+              )}
               {result && (
                 <button
                   onClick={handleExportGroup}
@@ -1353,7 +1769,11 @@ export default function ParentInheritance({ onRefresh }) {
                 className="flex items-center gap-2 px-6 py-2.5 bg-purple-600 text-white rounded-lg hover:bg-purple-700 text-sm font-medium disabled:opacity-50 transition-colors"
               >
                 {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
-                {loading ? 'Uygulanıyor...' : `${children.length} Child'a Uygula`}
+                {loading ? 'Uygulanıyor...' : (
+                  applyToParentGroup
+                    ? `${selectedParentCostGroupItemSet.size} Parent Grubuna Uygula`
+                    : `${children.length} Child'a Uygula`
+                )}
               </button>
             </div>
           </div>
@@ -1417,6 +1837,36 @@ export default function ParentInheritance({ onRefresh }) {
               </div>
             ))}
           </div>
+
+          {groupApplyResult && (
+            <div className="mb-4 p-3 rounded-lg border border-purple-200 bg-purple-50">
+              <div className="text-sm font-semibold text-purple-900 mb-1">
+                Grup Uygulama Sonucu
+              </div>
+              <div className="text-xs text-purple-800 mb-2">
+                Hedef: {groupApplyResult.target_count} parent | Başarılı: {groupApplyResult.success_count} | Hata: {groupApplyResult.failure_count}
+                {' '}| Güncellenen child: {groupApplyResult.total_children_updated} | Atlanan child: {groupApplyResult.total_children_skipped}
+              </div>
+              {groupApplyResult.results?.length > 0 && (
+                <div className="max-h-32 overflow-y-auto text-xs space-y-1 mb-2">
+                  {groupApplyResult.results.map((row) => (
+                    <div key={`group-result-${row.parent_name}`} className="text-purple-900">
+                      {row.parent_name}: +{row.children_updated} güncellendi, {row.children_skipped} atlandı
+                    </div>
+                  ))}
+                </div>
+              )}
+              {groupApplyResult.failures?.length > 0 && (
+                <div className="max-h-28 overflow-y-auto text-xs space-y-1 text-red-700">
+                  {groupApplyResult.failures.map((row) => (
+                    <div key={`group-failure-${row.parent_name}`}>
+                      {row.parent_name}: {row.error}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Result table */}
           {result && (

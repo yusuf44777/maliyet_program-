@@ -9,6 +9,7 @@ import {
   CheckCircle2,
 } from 'lucide-react';
 import { applyCostPropagation, searchParentProducts } from '../api';
+import HelpTip from './HelpTip';
 
 const EMPTY_DYNAMIC_ROW = { key: '', value: '' };
 
@@ -155,7 +156,13 @@ export default function CostPropagation() {
   return (
     <div className="space-y-6">
       <div className="bg-white rounded-xl border border-gray-200 p-6 shadow-sm">
-        <h3 className="text-lg font-semibold text-gray-900 mb-4">Parent Ürün Seçimi</h3>
+        <div className="flex items-center gap-2 mb-4">
+          <h3 className="text-lg font-semibold text-gray-900">Parent Ürün Seçimi</h3>
+          <HelpTip
+            title="Neden parent seçiyoruz?"
+            text="Maliyet kırılımı önce parent ürüne yazılır, sonra o parent altındaki tüm child ürünlere aynı değerler yayılır."
+          />
+        </div>
 
         <div className="relative">
           <label className="text-xs text-gray-500 mb-1 block">
@@ -223,7 +230,13 @@ export default function CostPropagation() {
       </div>
 
       <div className="bg-white rounded-xl border border-gray-200 p-6 shadow-sm space-y-5">
-        <h3 className="text-lg font-semibold text-gray-900">Maliyet Kırılımı</h3>
+        <div className="flex items-center gap-2">
+          <h3 className="text-lg font-semibold text-gray-900">Maliyet Kırılımı</h3>
+          <HelpTip
+            title="Neyi doldurmalıyım?"
+            text="Sabit alanları ve gerekiyorsa dinamik alanları girin. Sayısal değerleri sayı formatında girerseniz sistem doğru hesaplar."
+          />
+        </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
           <div>
@@ -315,6 +328,11 @@ export default function CostPropagation() {
             {applying ? <Loader2 className="w-4 h-4 animate-spin" /> : <ArrowRightLeft className="w-4 h-4" />}
             {applying ? 'Aktarılıyor...' : 'Apply / Transfer Costs'}
           </button>
+          <HelpTip
+            title="Bu işlem ne yapar?"
+            text="Parent kaydını günceller ve bağlı child ürünlerin maliyet kırılımını aynı payload ile toplu günceller."
+            placement="bottom"
+          />
 
           {!selectedParent && (
             <span className="text-xs text-gray-500">Devam etmek için parent ürün seçin</span>

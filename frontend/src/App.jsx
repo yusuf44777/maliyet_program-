@@ -9,6 +9,8 @@ import CostPropagation from './components/CostPropagation';
 import ProductDetail from './components/ProductDetail';
 import LoginScreen from './components/LoginScreen';
 import UserManager from './components/UserManager';
+import HelpTip from './components/HelpTip';
+import UserTutorialModal from './components/UserTutorialModal';
 import { getStats, loginAuth, getMe, changePassword, setAuthToken, clearAuthToken, getAuthToken } from './api';
 import {
   LayoutDashboard,
@@ -21,6 +23,7 @@ import {
   Shield,
   LogOut,
   KeyRound,
+  BookOpen,
 } from 'lucide-react';
 
 export default function App() {
@@ -29,6 +32,7 @@ export default function App() {
   const [selectedProduct, setSelectedProduct] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [user, setUser] = useState(null);
+  const [tutorialOpen, setTutorialOpen] = useState(false);
 
   const isAdmin = user?.role === 'admin';
   const tabs = useMemo(() => {
@@ -157,6 +161,12 @@ export default function App() {
   return (
     <div className="min-h-screen">
       <Toaster position="top-right" />
+      <UserTutorialModal
+        open={tutorialOpen}
+        onClose={() => setTutorialOpen(false)}
+        activeTab={activeTab}
+        isAdmin={isAdmin}
+      />
 
       {/* Header */}
       <header className="bg-white border-b border-gray-200 shadow-sm">
@@ -165,7 +175,14 @@ export default function App() {
             <div className="flex items-center gap-3">
               <FileSpreadsheet className="w-8 h-8 text-blue-600" />
               <div>
-                <h1 className="text-xl font-bold text-gray-900">Maliyet Sistemi</h1>
+                <div className="flex items-center gap-2">
+                  <h1 className="text-xl font-bold text-gray-900">Maliyet Sistemi</h1>
+                  <HelpTip
+                    title="Bu ekran ne için?"
+                    text="Bu başlık altındaki menülerden ürün, maliyet ve aktarım işlemlerini yapabilirsiniz. Kararsız kaldığınız yerde mavi soru işaretine tıklayın."
+                    placement="bottom"
+                  />
+                </div>
                 <p className="text-sm text-gray-500">ERP Maliyet Şablonu Yönetimi</p>
               </div>
             </div>
@@ -187,6 +204,15 @@ export default function App() {
                 {user.role}
               </span>
               <span className="text-gray-600">{user.username}</span>
+              <button
+                type="button"
+                onClick={() => setTutorialOpen(true)}
+                className="inline-flex items-center gap-1 px-2 py-1 rounded border border-blue-200 text-blue-700 hover:bg-blue-50"
+                title="Kullanım rehberini aç"
+              >
+                <BookOpen className="w-3 h-3" />
+                Yardım
+              </button>
               <button
                 onClick={handleChangePassword}
                 className="inline-flex items-center gap-1 px-2 py-1 rounded border border-gray-200 text-gray-600 hover:bg-gray-50"
@@ -222,6 +248,14 @@ export default function App() {
                 {tab.label}
               </button>
             ))}
+            <button
+              type="button"
+              onClick={() => setTutorialOpen(true)}
+              className="ml-auto flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium text-blue-700 hover:bg-blue-50 border border-blue-200"
+            >
+              <BookOpen className="w-4 h-4" />
+              Nasıl Kullanılır?
+            </button>
           </nav>
         </div>
       </header>

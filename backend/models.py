@@ -151,6 +151,38 @@ class CostPropagationRequest(BaseModel):
     cost_breakdown: dict[str, Any] = Field(default_factory=dict)
 
 
+class ParentCostGroupItemInput(BaseModel):
+    parent_name: str
+    kategori: Optional[str] = None
+
+
+class ParentCostGroupCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+
+
+class ParentCostGroupUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class ParentCostGroupItemsRequest(BaseModel):
+    parents: list[ParentCostGroupItemInput] = Field(default_factory=list)
+
+
+class ParentCostGroupInheritanceApplyRequest(BaseModel):
+    cost_map: dict[str, str]  # { variation_size: cost_name }
+    kaplama_map: dict[str, str | list[str]] = Field(default_factory=dict)
+    kaplama_name_map: dict[str, str | list[str]] = Field(default_factory=dict)
+    allow_missing_kaplama: bool = False
+    weight_map: dict[str, float]  # { variation_size: kargo_agirlik }
+    materials: dict[int, float]  # { material_id: quantity }
+    sac_material_id: Optional[int] = None
+    mdf_material_id: Optional[int] = None
+    selected_parent_name: Optional[str] = None
+
+
 class StatsResponse(BaseModel):
     total_products: int
     metal_products: int

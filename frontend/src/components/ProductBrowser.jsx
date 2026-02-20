@@ -6,6 +6,7 @@ import {
   Search, ChevronLeft, ChevronRight, Filter, Download,
   ArrowUpDown, Eye, Package,
 } from 'lucide-react';
+import HelpTip from './HelpTip';
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100];
 
@@ -176,6 +177,13 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
     <div className="space-y-4">
       {/* Filtreler */}
       <div className="bg-white rounded-xl border border-gray-200 p-4 shadow-sm">
+        <div className="flex items-center gap-2 mb-3">
+          <span className="text-sm font-semibold text-gray-800">Filtreler ve Liste</span>
+          <HelpTip
+            title="Nasıl kullanılır?"
+            text="Önce arama ve kategori filtresi verin. Sonra Tablo/Gruplar görünümü arasında geçip doğru kayıtları bulun."
+          />
+        </div>
         <div className="flex flex-wrap gap-3 items-end">
           {/* Arama */}
           <div className="flex-1 min-w-[200px]">
@@ -266,6 +274,11 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
             >
               Gruplar
             </button>
+            <HelpTip
+              title="Tablo vs Gruplar"
+              text="Tablo tek tek ürünleri gösterir. Gruplar görünümü aynı parent altında kaç varyant olduğunu özetler."
+              placement="bottom"
+            />
           </div>
 
           {/* Export */}
