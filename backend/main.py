@@ -46,6 +46,7 @@ from models import (
     ProductSyncRequest, ApprovalReviewRequest,
     CostDefinitionCreate, CostDefinitionUpdate,
     AuthLoginRequest, AuthChangePasswordRequest, AuthUserCreate, AuthUserUpdate,
+    ParentSearchItem, CostPropagationRequest,
 )
 from excel_engine import export_to_template, get_template_structure
 from storage_utils import is_http_url, cache_remote_file
@@ -159,6 +160,7 @@ ADMIN_ONLY_RULES: list[tuple[str, str]] = [
     ("POST", "/api/reload-db"),
     ("POST", "/api/sync-products"),
     ("POST", "/api/products/deactivate-cus"),
+    ("POST", "/api/cost-propagation/apply"),
     ("GET", "/api/quality/report"),
     ("GET", "/api/approvals"),
     ("POST", "/api/approvals/"),
@@ -324,6 +326,46 @@ def normalize_cost_name_list(value, canonicalize_kaplama: bool = False) -> list[
             continue
         seen.add(key)
         out.append(name)
+    return out
+
+
+def normalize_cost_breakdown_payload(payload: dict | None) -> dict:
+    """Dinamik maliyet kırılımını temizler ve JSON-uyumlu hale getirir."""
+    if not isinstance(payload, dict):
+        return {}
+
+    out: dict[str, str | float | bool | None] = {}
+    for raw_key, raw_value in payload.items():
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        key = key[:96]
+
+        if raw_value is None:
+            out[key] = None
+            continue
+        if isinstance(raw_value, bool):
+            out[key] = raw_value
+            continue
+        if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+            number_value = float(raw_value)
+            if math.isfinite(number_value):
+                out[key] = round(number_value, 6)
+            continue
+
+        text_value = str(raw_value).strip()
+        if not text_value:
+            continue
+        normalized_text = text_value.replace(",", ".")
+        try:
+            numeric_candidate = float(normalized_text)
+            if math.isfinite(numeric_candidate):
+                out[key] = round(numeric_candidate, 6)
+                continue
+        except Exception:
+            pass
+        out[key] = text_value[:512]
+
     return out
 
 
@@ -1682,6 +1724,63 @@ def list_product_groups(
     return response
 
 
+@app.get("/api/parents/search", response_model=list[ParentSearchItem])
+def search_parent_products(
+    q: Optional[str] = None,
+    limit: int = Query(30, ge=1, le=200),
+):
+    """
+    Parent ürünleri SKU + isim alanında arar.
+    Parent listesi products tablosundaki distinct parent_id kümelerinden türetilir.
+    """
+    conn = get_db()
+    where_clauses = ["is_active = 1", "parent_id IS NOT NULL"]
+    params: list = []
+
+    search_text = (q or "").strip().lower()
+    if search_text:
+        where_clauses.append(
+            "(LOWER(COALESCE(product_identifier, '')) LIKE ? OR LOWER(COALESCE(parent_name, '')) LIKE ?)"
+        )
+        like = f"%{search_text}%"
+        params.extend([like, like])
+
+    where_sql = " AND ".join(where_clauses)
+    rows = conn.execute(
+        f"""
+        SELECT
+            parent_id,
+            COALESCE(NULLIF(TRIM(parent_name), ''), '(isimsiz parent)') AS parent_name,
+            MIN(NULLIF(TRIM(product_identifier), '')) AS parent_sku,
+            COUNT(*) AS child_count
+        FROM products
+        WHERE {where_sql}
+        GROUP BY parent_id, parent_name
+        ORDER BY child_count DESC, parent_name ASC
+        LIMIT ?
+        """,
+        params + [limit],
+    ).fetchall()
+    conn.close()
+
+    result: list[dict] = []
+    for row in rows:
+        raw_parent_id = row.get("parent_id") if isinstance(row, dict) else row["parent_id"]
+        try:
+            parent_id = float(raw_parent_id)
+        except (TypeError, ValueError):
+            continue
+        result.append(
+            {
+                "parent_id": parent_id,
+                "parent_name": str((row.get("parent_name") if isinstance(row, dict) else row["parent_name"]) or "").strip(),
+                "parent_sku": (row.get("parent_sku") if isinstance(row, dict) else row["parent_sku"]),
+                "child_count": int((row.get("child_count") if isinstance(row, dict) else row["child_count"]) or 0),
+            }
+        )
+    return result
+
+
 # ─────────────────────────── RAW MATERIALS ───────────────────────────
 
 @app.get("/api/materials")
@@ -2274,6 +2373,163 @@ def set_product_cost(entry: ProductCostAssignment, request: Request):
         },
     )
     return {"status": "ok"}
+
+
+@app.post("/api/cost-propagation/apply")
+def apply_cost_propagation(data: CostPropagationRequest, request: Request):
+    """
+    Parent için maliyet kırılımı kaydeder ve tüm child ürünlere aynalar.
+    İşlem tek transaction içinde çalışır (atomic).
+    """
+    admin = require_admin_user(request)
+    normalized_payload = normalize_cost_breakdown_payload(data.cost_breakdown)
+    if not normalized_payload:
+        raise HTTPException(status_code=400, detail="En az bir maliyet alanı girilmelidir")
+
+    try:
+        parent_id = float(data.parent_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Geçersiz parent_id")
+    if not math.isfinite(parent_id):
+        raise HTTPException(status_code=400, detail="Geçersiz parent_id")
+
+    parent_name_input = str(data.parent_name or "").strip()
+    parent_sku_input = str(data.parent_sku or "").strip() or None
+
+    conn = get_db()
+    try:
+        child_rows = conn.execute(
+            """
+            SELECT child_sku, parent_name, product_identifier
+            FROM products
+            WHERE parent_id = ? AND is_active = 1
+            ORDER BY child_sku
+            """,
+            (parent_id,),
+        ).fetchall()
+
+        profile_row = conn.execute(
+            """
+            SELECT parent_name, parent_sku
+            FROM parent_cost_profiles
+            WHERE parent_id = ?
+            """,
+            (parent_id,),
+        ).fetchone()
+
+        parent_name = parent_name_input
+        parent_sku = parent_sku_input
+
+        if child_rows:
+            if not parent_name:
+                parent_name = str(child_rows[0]["parent_name"] or "").strip()
+            if not parent_sku:
+                for row in child_rows:
+                    candidate = str(row["product_identifier"] or "").strip()
+                    if candidate:
+                        parent_sku = candidate
+                        break
+        elif profile_row:
+            if not parent_name:
+                parent_name = str(profile_row["parent_name"] or "").strip()
+            if not parent_sku:
+                parent_sku = str(profile_row["parent_sku"] or "").strip() or None
+
+        if not parent_name:
+            parent_name = f"Parent {parent_id:g}"
+
+        payload_json = json.dumps(normalized_payload, ensure_ascii=False, separators=(",", ":"))
+        conn.execute(
+            """
+            INSERT INTO parent_cost_profiles
+            (parent_id, parent_name, parent_sku, breakdown_payload, updated_by, updated_by_username, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(parent_id) DO UPDATE SET
+                parent_name = EXCLUDED.parent_name,
+                parent_sku = EXCLUDED.parent_sku,
+                breakdown_payload = EXCLUDED.breakdown_payload,
+                updated_by = EXCLUDED.updated_by,
+                updated_by_username = EXCLUDED.updated_by_username,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                parent_id,
+                parent_name,
+                parent_sku,
+                payload_json,
+                admin["id"],
+                admin["username"],
+            ),
+        )
+
+        child_skus = [str(row["child_sku"]) for row in child_rows if str(row["child_sku"] or "").strip()]
+        if child_skus:
+            conn.executemany(
+                """
+                INSERT INTO product_cost_breakdowns
+                (child_sku, parent_id, breakdown_payload, updated_by, updated_by_username, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(child_sku) DO UPDATE SET
+                    parent_id = EXCLUDED.parent_id,
+                    breakdown_payload = EXCLUDED.breakdown_payload,
+                    updated_by = EXCLUDED.updated_by,
+                    updated_by_username = EXCLUDED.updated_by_username,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                [
+                    (
+                        sku,
+                        parent_id,
+                        payload_json,
+                        admin["id"],
+                        admin["username"],
+                    )
+                    for sku in child_skus
+                ],
+            )
+
+        conn.commit()
+    except HTTPException:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+        raise
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+        logger.exception("[cost-propagation] apply failed parent_id=%s", data.parent_id)
+        raise HTTPException(status_code=500, detail="Maliyet aktarımı sırasında bir hata oluştu")
+    else:
+        conn.close()
+
+    children_updated = len(child_skus)
+    write_audit_log(
+        admin,
+        "costs.propagate",
+        target=str(parent_id),
+        details={
+            "parent_id": parent_id,
+            "parent_name": parent_name,
+            "parent_sku": parent_sku,
+            "children_updated": children_updated,
+            "cost_keys": list(normalized_payload.keys()),
+        },
+    )
+
+    return {
+        "status": "ok",
+        "parent_id": parent_id,
+        "parent_name": parent_name,
+        "parent_sku": parent_sku,
+        "children_updated": children_updated,
+        "children_sample": child_skus[:20],
+        "cost_breakdown": normalized_payload,
+    }
 
 
 # ─────────────────────── PARENT-TO-CHILD INHERITANCE ───────────────────────
@@ -3142,6 +3398,8 @@ def reload_database(request: Request):
     conn = get_db()
     conn.execute("DELETE FROM product_materials")
     conn.execute("DELETE FROM product_costs")
+    conn.execute("DELETE FROM product_cost_breakdowns")
+    conn.execute("DELETE FROM parent_cost_profiles")
     conn.execute("DELETE FROM cost_definitions")
     conn.execute("DELETE FROM products")
     conn.execute("DELETE FROM raw_materials")

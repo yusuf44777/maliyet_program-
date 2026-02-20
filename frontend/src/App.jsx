@@ -5,6 +5,7 @@ import Dashboard from './components/Dashboard';
 import ProductBrowser from './components/ProductBrowser';
 import MaterialManager from './components/MaterialManager';
 import ParentInheritance from './components/ParentInheritance';
+import CostPropagation from './components/CostPropagation';
 import ProductDetail from './components/ProductDetail';
 import LoginScreen from './components/LoginScreen';
 import UserManager from './components/UserManager';
@@ -15,6 +16,7 @@ import {
   Hammer,
   FileSpreadsheet,
   GitBranch,
+  ArrowRightLeft,
   Users,
   Shield,
   LogOut,
@@ -37,6 +39,7 @@ export default function App() {
     ];
     if (isAdmin) {
       base.push({ id: 'materials', label: 'Hammaddeler', icon: Hammer });
+      base.push({ id: 'cost-propagation', label: 'Maliyet Yayılımı', icon: ArrowRightLeft });
       base.push({ id: 'users', label: 'Kullanıcılar', icon: Users });
     }
     return base;
@@ -239,6 +242,9 @@ export default function App() {
         )}
         {activeTab === 'materials' && isAdmin && (
           <MaterialManager onRefresh={refreshStats} />
+        )}
+        {activeTab === 'cost-propagation' && isAdmin && (
+          <CostPropagation />
         )}
         {activeTab === 'users' && isAdmin && (
           <UserManager currentUser={user} />

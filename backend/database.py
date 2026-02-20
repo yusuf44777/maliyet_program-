@@ -573,6 +573,8 @@ def ensure_indexes(cursor):
     index_sql = [
         "CREATE INDEX IF NOT EXISTS idx_products_kategori ON products(kategori)",
         "CREATE INDEX IF NOT EXISTS idx_products_is_active ON products(is_active)",
+        "CREATE INDEX IF NOT EXISTS idx_products_parent_id ON products(parent_id)",
+        "CREATE INDEX IF NOT EXISTS idx_products_parent_id_active ON products(parent_id, is_active)",
         "CREATE INDEX IF NOT EXISTS idx_products_parent_name ON products(parent_name)",
         "CREATE INDEX IF NOT EXISTS idx_products_parent_kategori ON products(parent_name, kategori)",
         "CREATE INDEX IF NOT EXISTS idx_products_parent_active ON products(parent_name, is_active)",
@@ -588,6 +590,9 @@ def ensure_indexes(cursor):
         "CREATE INDEX IF NOT EXISTS idx_product_costs_assigned ON product_costs(assigned)",
         "CREATE INDEX IF NOT EXISTS idx_cost_definitions_category_active ON cost_definitions(category, is_active)",
         "CREATE INDEX IF NOT EXISTS idx_cost_definitions_kargo_code ON cost_definitions(kargo_code)",
+        "CREATE INDEX IF NOT EXISTS idx_parent_cost_profiles_parent_id ON parent_cost_profiles(parent_id)",
+        "CREATE INDEX IF NOT EXISTS idx_product_cost_breakdowns_parent_id ON product_cost_breakdowns(parent_id)",
+        "CREATE INDEX IF NOT EXISTS idx_product_cost_breakdowns_child_sku ON product_cost_breakdowns(child_sku)",
         "CREATE INDEX IF NOT EXISTS idx_users_role_active ON users(role, is_active)",
         "CREATE INDEX IF NOT EXISTS idx_users_username_lower ON users(LOWER(username))",
         "CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at)",
@@ -673,6 +678,34 @@ def init_db():
             assigned INTEGER DEFAULT 0,
             FOREIGN KEY (child_sku) REFERENCES products(child_sku),
             UNIQUE(child_sku, cost_name)
+        )
+    """)
+
+    # Parent seviyesinde tanımlanan maliyet kırılım profilleri
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS parent_cost_profiles (
+            id {id_col},
+            parent_id REAL NOT NULL UNIQUE,
+            parent_name TEXT,
+            parent_sku TEXT,
+            breakdown_payload TEXT NOT NULL,
+            updated_by {ref_id_type},
+            updated_by_username TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Child seviyesine aynalanan maliyet kırılımı
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS product_cost_breakdowns (
+            id {id_col},
+            child_sku TEXT NOT NULL UNIQUE,
+            parent_id REAL,
+            breakdown_payload TEXT NOT NULL,
+            updated_by {ref_id_type},
+            updated_by_username TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (child_sku) REFERENCES products(child_sku)
         )
     """)
 
@@ -809,6 +842,10 @@ def load_mapped_products(categories: list[str] | None = None, replace_existing: 
         for kategori_name in selected_categories:
             cursor.execute(
                 "DELETE FROM product_materials WHERE child_sku IN (SELECT child_sku FROM products WHERE kategori = ?)",
+                (kategori_name,),
+            )
+            cursor.execute(
+                "DELETE FROM product_cost_breakdowns WHERE child_sku IN (SELECT child_sku FROM products WHERE kategori = ?)",
                 (kategori_name,),
             )
             cursor.execute(

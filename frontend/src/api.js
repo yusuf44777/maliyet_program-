@@ -63,6 +63,8 @@ export const getProductGroups = (paramsOrKategori, options = {}) => {
     : (paramsOrKategori || {});
   return api.get('/product-groups', { params, ...options }).then(r => r.data);
 };
+export const searchParentProducts = (params, options = {}) =>
+  api.get('/parents/search', { params, ...options }).then(r => r.data);
 
 // ─── Materials ───
 export const getMaterials = () => api.get('/materials').then(r => r.data);
@@ -88,6 +90,7 @@ export const getKaplamaSuggestions = (parentName) =>
 export const getKaplamaNameSuggestions = (parentName) =>
   api.get('/kaplama-name-suggestions', { params: { parent_name: parentName } }).then(r => r.data);
 export const setProductCost = (data) => api.post('/product-costs', data).then(r => r.data);
+export const applyCostPropagation = (data) => api.post('/cost-propagation/apply', data).then(r => r.data);
 
 // ─── Inheritance ───
 export const applyInheritance = (data) => api.post('/inherit', data).then(r => r.data);

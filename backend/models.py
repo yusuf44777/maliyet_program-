@@ -3,7 +3,7 @@ Maliyet Sistemi - Pydantic Modelleri
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional, Literal
+from typing import Optional, Literal, Any
 from datetime import datetime
 
 
@@ -135,6 +135,20 @@ class AuthUserUpdate(BaseModel):
     password: Optional[str] = None
     role: Optional[Literal["admin", "user"]] = None
     is_active: Optional[bool] = None
+
+
+class ParentSearchItem(BaseModel):
+    parent_id: float
+    parent_name: str
+    parent_sku: Optional[str] = None
+    child_count: int
+
+
+class CostPropagationRequest(BaseModel):
+    parent_id: float
+    parent_name: Optional[str] = None
+    parent_sku: Optional[str] = None
+    cost_breakdown: dict[str, Any] = Field(default_factory=dict)
 
 
 class StatsResponse(BaseModel):
