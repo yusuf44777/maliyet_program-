@@ -4,6 +4,7 @@ import {
   getKargoOptions, getKaplamaNameSuggestions, applyInheritance, exportExcel, getInheritancePrefill,
   getParentCostGroups, createParentCostGroup, deleteParentCostGroup,
   addParentCostGroupItems, removeParentCostGroupItems, applyParentCostGroupInheritanceAtomic,
+  searchParentProducts,
 } from '../api';
 import { CATEGORY_OPTIONS, getCategoryBadgeClass } from '../categoryUtils';
 import toast from 'react-hot-toast';
@@ -85,6 +86,99 @@ function toggleKaplamaSelection(currentValue, optionName, checked) {
   return current;
 }
 
+const PARENT_JSON_OBJECT_KEYS = [
+  'parent_name',
+  'parent_sku',
+  'product_identifier',
+  'sku',
+  'code',
+  'parent',
+];
+
+function normalizeParentLookupText(value) {
+  return String(value || '').trim().toLocaleLowerCase('tr');
+}
+
+function readParentTokenFromJsonItem(item) {
+  if (typeof item === 'string' || typeof item === 'number') {
+    const token = String(item).trim();
+    return token || null;
+  }
+  if (!item || typeof item !== 'object') return null;
+  for (const key of PARENT_JSON_OBJECT_KEYS) {
+    const raw = item[key];
+    if (typeof raw === 'string' || typeof raw === 'number') {
+      const token = String(raw).trim();
+      if (token) return token;
+    }
+  }
+  return null;
+}
+
+function parseParentJsonPayload(text) {
+  const source = String(text || '').trim();
+  if (!source) {
+    throw new Error('JSON boş olamaz');
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(source);
+  } catch {
+    throw new Error('Geçersiz JSON formatı');
+  }
+
+  let rows = null;
+  if (Array.isArray(parsed)) {
+    rows = parsed;
+  } else if (parsed && typeof parsed === 'object') {
+    if (Array.isArray(parsed.parents)) rows = parsed.parents;
+    else if (Array.isArray(parsed.parent_names)) rows = parsed.parent_names;
+    else {
+      throw new Error('Desteklenen formatlar: [] / { "parents": [] } / { "parent_names": [] }');
+    }
+  } else {
+    throw new Error('Desteklenen formatlar: [] / { "parents": [] } / { "parent_names": [] }');
+  }
+
+  const tokens = [];
+  const seen = new Set();
+  let duplicateCount = 0;
+  let ignoredCount = 0;
+
+  for (const row of rows) {
+    const token = readParentTokenFromJsonItem(row);
+    if (!token) {
+      ignoredCount += 1;
+      continue;
+    }
+    const key = normalizeParentLookupText(token);
+    if (!key) {
+      ignoredCount += 1;
+      continue;
+    }
+    if (seen.has(key)) {
+      duplicateCount += 1;
+      continue;
+    }
+    seen.add(key);
+    tokens.push(token);
+  }
+
+  if (tokens.length === 0) {
+    throw new Error('JSON içinde işlenebilir parent değeri bulunamadı');
+  }
+
+  return { tokens, duplicateCount, ignoredCount };
+}
+
+function summarizeList(items, max = 5) {
+  const clean = (items || []).map(v => String(v || '').trim()).filter(Boolean);
+  if (clean.length === 0) return '';
+  if (clean.length <= max) return clean.join(', ');
+  return `${clean.slice(0, max).join(', ')} +${clean.length - max}`;
+}
+
 // ─── Step indicator ───
 function StepBadge({ number, label, active, done }) {
   return (
@@ -138,6 +232,8 @@ export default function ParentInheritance({ onRefresh }) {
   const [newParentCostGroupDescription, setNewParentCostGroupDescription] = useState('');
   const [creatingParentCostGroup, setCreatingParentCostGroup] = useState(false);
   const [groupItemSaving, setGroupItemSaving] = useState(false);
+  const [parentJsonInput, setParentJsonInput] = useState('');
+  const [parentJsonImporting, setParentJsonImporting] = useState(false);
   const [showOnlySelectedParentCostGroup, setShowOnlySelectedParentCostGroup] = useState(false);
   const [applyToParentGroup, setApplyToParentGroup] = useState(false);
   const [groupApplyResult, setGroupApplyResult] = useState(null);
@@ -235,6 +331,10 @@ export default function ParentInheritance({ onRefresh }) {
     () => parentCostGroups.find(g => Number(g.id) === Number(selectedParentCostGroupId)) || null,
     [parentCostGroups, selectedParentCostGroupId]
   );
+
+  useEffect(() => {
+    setParentJsonInput('');
+  }, [selectedParentCostGroupId]);
 
   const selectedParentCostGroupItemSet = useMemo(() => {
     const items = selectedParentCostGroup?.items || [];
@@ -832,6 +932,128 @@ export default function ParentInheritance({ onRefresh }) {
     }
   };
 
+  const handleAddParentsFromJson = async () => {
+    if (!selectedParentCostGroup?.id) {
+      toast.error('Önce bir maliyet grubu seçin');
+      return;
+    }
+
+    let parsed;
+    try {
+      parsed = parseParentJsonPayload(parentJsonInput);
+    } catch (err) {
+      toast.error(err?.message || 'JSON parse edilemedi');
+      return;
+    }
+
+    setParentJsonImporting(true);
+    try {
+      const resolveCache = new Map();
+      const alreadyInGroup = [];
+      const unresolved = [];
+      const payloadParents = [];
+      const payloadParentKeys = new Set();
+
+      for (const token of parsed.tokens) {
+        const tokenKey = normalizeParentLookupText(token);
+        if (!tokenKey) continue;
+
+        let resolved = resolveCache.get(tokenKey);
+        if (!resolved) {
+          const rows = await searchParentProducts({ q: token, limit: 50 });
+          const candidates = Array.isArray(rows) ? rows : [];
+          const exactSku = candidates.filter(
+            (item) => normalizeParentLookupText(item?.parent_sku) === tokenKey,
+          );
+          const exactName = candidates.filter(
+            (item) => normalizeParentLookupText(item?.parent_name) === tokenKey,
+          );
+
+          if (exactSku.length === 1) {
+            resolved = { parent_name: exactSku[0].parent_name };
+          } else if (exactSku.length > 1) {
+            resolved = { reason: 'birden fazla SKU eşleşmesi' };
+          } else if (exactName.length === 1) {
+            resolved = { parent_name: exactName[0].parent_name };
+          } else if (exactName.length > 1) {
+            resolved = { reason: 'birden fazla parent adı eşleşmesi' };
+          } else if (candidates.length === 1) {
+            resolved = { parent_name: candidates[0].parent_name };
+          } else if (candidates.length === 0) {
+            resolved = { reason: 'eşleşme bulunamadı' };
+          } else {
+            resolved = { reason: 'birden fazla olası eşleşme' };
+          }
+
+          resolveCache.set(tokenKey, resolved);
+        }
+
+        const parentName = String(resolved?.parent_name || '').trim();
+        if (!parentName) {
+          unresolved.push(`${token} (${resolved?.reason || 'eşleşemedi'})`);
+          continue;
+        }
+
+        const parentKey = normalizeParentLookupText(parentName);
+        if (!parentKey) {
+          unresolved.push(`${token} (boş parent adı)`);
+          continue;
+        }
+        if (selectedParentCostGroupItemSet.has(parentKey)) {
+          alreadyInGroup.push(parentName);
+          continue;
+        }
+        if (payloadParentKeys.has(parentKey)) {
+          continue;
+        }
+        payloadParentKeys.add(parentKey);
+        payloadParents.push({ parent_name: parentName });
+      }
+
+      if (payloadParents.length === 0) {
+        const notes = [];
+        if (alreadyInGroup.length > 0) notes.push(`${alreadyInGroup.length} parent zaten grupta`);
+        if (unresolved.length > 0) notes.push(`${unresolved.length} parent çözümlenemedi`);
+        if (parsed.duplicateCount > 0) notes.push(`${parsed.duplicateCount} tekrar atlandı`);
+        if (parsed.ignoredCount > 0) notes.push(`${parsed.ignoredCount} satır format dışı`);
+        toast.error(`Eklenebilir parent bulunamadı${notes.length ? `: ${notes.join(', ')}` : ''}`);
+        return;
+      }
+
+      const res = await addParentCostGroupItems(selectedParentCostGroup.id, {
+        parents: payloadParents,
+      });
+      await fetchParentCostGroups();
+
+      const missingParents = Array.isArray(res?.missing_parents) ? res.missing_parents : [];
+      const addedCount = Number(res?.added_count ?? payloadParents.length);
+      toast.success(`${addedCount} parent gruba eklendi`);
+
+      const notes = [];
+      if (alreadyInGroup.length > 0) notes.push(`${alreadyInGroup.length} zaten gruptaydı`);
+      if (unresolved.length > 0) notes.push(`${unresolved.length} çözümlenemedi`);
+      if (missingParents.length > 0) notes.push(`${missingParents.length} DB'de bulunamadı`);
+      if (parsed.duplicateCount > 0) notes.push(`${parsed.duplicateCount} tekrar satırı atlandı`);
+      if (parsed.ignoredCount > 0) notes.push(`${parsed.ignoredCount} satır format dışıydı`);
+      if (notes.length > 0) toast(notes.join(' | '));
+
+      if (unresolved.length > 0) {
+        toast(`Çözümlenemeyen örnekler: ${summarizeList(unresolved, 3)}`);
+      }
+      if (missingParents.length > 0) {
+        toast(`DB'de bulunamayanlar: ${summarizeList(missingParents, 3)}`);
+      }
+
+      if (unresolved.length === 0 && missingParents.length === 0) {
+        setParentJsonInput('');
+      }
+    } catch (err) {
+      toast.error('JSON import hatası: ' + (err.response?.data?.detail || err.message));
+    } finally {
+      setParentJsonImporting(false);
+    }
+  };
+
   const handleRemoveParentFromSelectedCostGroup = async (parentName) => {
     const cleanParentName = String(parentName || '').trim();
     if (!selectedParentCostGroup?.id || !cleanParentName) return;
@@ -1160,6 +1382,45 @@ export default function ParentInheritance({ onRefresh }) {
                 <span className="text-xs text-blue-800">
                   {selectedParentCostGroup.name}: {selectedParentCostGroupItemSet.size} parent
                 </span>
+              </div>
+              <div className="mb-2.5 rounded-lg border border-blue-200 bg-white p-2.5">
+                <div className="flex items-center gap-2 mb-1.5">
+                  <span className="text-xs font-semibold text-blue-900">JSON ile Parent Ekle</span>
+                  <HelpTip
+                    title="JSON import nasıl çalışır?"
+                    text='Dizi veya nesne formatını kabul eder. SKU ya da parent adı yazabilirsiniz: ["IM-318"] veya {"parents":[{"parent_sku":"IM-318"}]}.'
+                    placement="bottom"
+                  />
+                </div>
+                <textarea
+                  value={parentJsonInput}
+                  onChange={(e) => setParentJsonInput(e.target.value)}
+                  placeholder={`["IM-318","IM-085","IA-169 Mihrab 8 111x150"]\nveya\n{"parents":[{"parent_sku":"IM-318"},{"parent_name":"IA-169 Mihrab 8 111x150"}]}`}
+                  rows={4}
+                  className="w-full px-2.5 py-2 border border-blue-200 rounded-lg text-xs font-mono bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+                <div className="mt-2 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleAddParentsFromJson}
+                    disabled={!parentJsonInput.trim() || parentJsonImporting || groupItemSaving}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border border-blue-300 bg-blue-600 text-white text-xs hover:bg-blue-700 disabled:opacity-50"
+                  >
+                    {parentJsonImporting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+                    JSON'dan Ekle
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setParentJsonInput('')}
+                    disabled={!parentJsonInput.trim() || parentJsonImporting}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border border-gray-200 text-xs text-gray-700 hover:bg-gray-100 disabled:opacity-50"
+                  >
+                    Temizle
+                  </button>
+                  <span className="text-[11px] text-blue-700">
+                    SKU veya parent adıyla toplu ekleme yapar.
+                  </span>
+                </div>
               </div>
               <div className="flex flex-wrap gap-1.5">
                 {(selectedParentCostGroup.items || []).length === 0 ? (
