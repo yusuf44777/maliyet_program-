@@ -54,13 +54,14 @@ export const getAuditLogs = (params) => api.get('/auth/audit-logs', { params }).
 export const getStats = () => api.get('/stats').then(r => r.data);
 
 // ─── Products ───
-export const getProducts = (params) => api.get('/products', { params }).then(r => r.data);
+export const getProducts = (params, options = {}) =>
+  api.get('/products', { params, ...options }).then(r => r.data);
 export const getProduct = (sku) => api.get(`/products/${encodeURIComponent(sku)}`).then(r => r.data);
-export const getProductGroups = (paramsOrKategori) => {
+export const getProductGroups = (paramsOrKategori, options = {}) => {
   const params = typeof paramsOrKategori === 'string'
     ? (paramsOrKategori ? { kategori: paramsOrKategori } : {})
     : (paramsOrKategori || {});
-  return api.get('/product-groups', { params }).then(r => r.data);
+  return api.get('/product-groups', { params, ...options }).then(r => r.data);
 };
 
 // ─── Materials ───

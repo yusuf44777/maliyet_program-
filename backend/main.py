@@ -16,6 +16,7 @@ import time
 import json
 import math
 import uuid
+import threading
 import contextvars
 import base64
 import hmac
@@ -101,6 +102,10 @@ ENABLE_STARTUP_TEMPLATE_SYNC = env_flag(
     "ENABLE_STARTUP_TEMPLATE_SYNC",
     default=(not IS_PRODUCTION and not IS_VERCEL),
 )
+PRODUCT_GROUPS_CACHE_TTL_SECONDS = max(0, int(os.getenv("PRODUCT_GROUPS_CACHE_TTL_SECONDS", "45")))
+PRODUCT_GROUPS_CACHE_MAX_ITEMS = max(10, int(os.getenv("PRODUCT_GROUPS_CACHE_MAX_ITEMS", "256")))
+_product_groups_cache: dict[str, tuple[float, dict]] = {}
+_product_groups_cache_lock = threading.Lock()
 
 app.add_middleware(
     CORSMiddleware,
@@ -163,6 +168,61 @@ ADMIN_ONLY_RULES: list[tuple[str, str]] = [
     ("DELETE", "/api/auth/users/"),
     ("GET", "/api/auth/audit-logs"),
 ]
+
+
+def build_product_groups_cache_key(
+    kategori: Optional[str],
+    search: Optional[str],
+    page: int,
+    page_size: int,
+) -> str:
+    return json.dumps(
+        {
+            "kategori": (kategori or "").strip().lower(),
+            "search": (search or "").strip().lower(),
+            "page": int(page),
+            "page_size": int(page_size),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def get_product_groups_cache(cache_key: str) -> dict | None:
+    if PRODUCT_GROUPS_CACHE_TTL_SECONDS <= 0:
+        return None
+    now = time.time()
+    with _product_groups_cache_lock:
+        cached = _product_groups_cache.get(cache_key)
+        if not cached:
+            return None
+        expires_at, payload = cached
+        if expires_at <= now:
+            _product_groups_cache.pop(cache_key, None)
+            return None
+        return payload
+
+
+def set_product_groups_cache(cache_key: str, payload: dict):
+    if PRODUCT_GROUPS_CACHE_TTL_SECONDS <= 0:
+        return
+    now = time.time()
+    expires_at = now + PRODUCT_GROUPS_CACHE_TTL_SECONDS
+    with _product_groups_cache_lock:
+        _product_groups_cache[cache_key] = (expires_at, payload)
+        expired = [key for key, (exp, _) in _product_groups_cache.items() if exp <= now]
+        for key in expired:
+            _product_groups_cache.pop(key, None)
+        overflow = len(_product_groups_cache) - PRODUCT_GROUPS_CACHE_MAX_ITEMS
+        if overflow > 0:
+            oldest_keys = list(_product_groups_cache.keys())[:overflow]
+            for key in oldest_keys:
+                _product_groups_cache.pop(key, None)
+
+
+def invalidate_product_groups_cache():
+    with _product_groups_cache_lock:
+        _product_groups_cache.clear()
 
 
 def validate_runtime_security():
@@ -1337,20 +1397,58 @@ def quality_report(request: Request):
 
 @app.get("/api/stats", response_model=StatsResponse)
 def get_stats():
+    started_at = time.perf_counter()
     conn = get_db()
-    stats = {
-        "total_products": row_first_value(conn.execute("SELECT COUNT(*) FROM products WHERE COALESCE(is_active, 1) = 1").fetchone()) or 0,
-        "metal_products": row_first_value(conn.execute("SELECT COUNT(*) FROM products WHERE kategori='metal' AND COALESCE(is_active, 1) = 1").fetchone()) or 0,
-        "ahsap_products": row_first_value(conn.execute("SELECT COUNT(*) FROM products WHERE kategori IN ('ahsap', 'ahşap') AND COALESCE(is_active, 1) = 1").fetchone()) or 0,
-        "cam_products": row_first_value(conn.execute("SELECT COUNT(*) FROM products WHERE kategori='cam' AND COALESCE(is_active, 1) = 1").fetchone()) or 0,
-        "harita_products": row_first_value(conn.execute("SELECT COUNT(*) FROM products WHERE kategori='harita' AND COALESCE(is_active, 1) = 1").fetchone()) or 0,
-        "mobilya_products": row_first_value(conn.execute("SELECT COUNT(*) FROM products WHERE kategori='mobilya' AND COALESCE(is_active, 1) = 1").fetchone()) or 0,
-        "products_with_dims": row_first_value(conn.execute("SELECT COUNT(*) FROM products WHERE en IS NOT NULL AND boy IS NOT NULL AND COALESCE(is_active, 1) = 1").fetchone()) or 0,
-        "products_without_dims": row_first_value(conn.execute("SELECT COUNT(*) FROM products WHERE (en IS NULL OR boy IS NULL) AND COALESCE(is_active, 1) = 1").fetchone()) or 0,
-        "total_materials": row_first_value(conn.execute("SELECT COUNT(*) FROM raw_materials").fetchone()) or 0,
-        "materials_with_price": row_first_value(conn.execute("SELECT COUNT(*) FROM raw_materials WHERE unit_price > 0").fetchone()) or 0,
-    }
+    row = conn.execute(
+        """
+        SELECT
+            p.total_products,
+            p.metal_products,
+            p.ahsap_products,
+            p.cam_products,
+            p.harita_products,
+            p.mobilya_products,
+            p.products_with_dims,
+            p.products_without_dims,
+            m.total_materials,
+            m.materials_with_price
+        FROM (
+            SELECT
+                COUNT(*) AS total_products,
+                SUM(CASE WHEN kategori = 'metal' THEN 1 ELSE 0 END) AS metal_products,
+                SUM(CASE WHEN kategori IN ('ahsap', 'ahşap') THEN 1 ELSE 0 END) AS ahsap_products,
+                SUM(CASE WHEN kategori = 'cam' THEN 1 ELSE 0 END) AS cam_products,
+                SUM(CASE WHEN kategori = 'harita' THEN 1 ELSE 0 END) AS harita_products,
+                SUM(CASE WHEN kategori = 'mobilya' THEN 1 ELSE 0 END) AS mobilya_products,
+                SUM(CASE WHEN en IS NOT NULL AND boy IS NOT NULL THEN 1 ELSE 0 END) AS products_with_dims,
+                SUM(CASE WHEN en IS NULL OR boy IS NULL THEN 1 ELSE 0 END) AS products_without_dims
+            FROM products
+            WHERE is_active = 1
+        ) p
+        CROSS JOIN (
+            SELECT
+                COUNT(*) AS total_materials,
+                SUM(CASE WHEN unit_price > 0 THEN 1 ELSE 0 END) AS materials_with_price
+            FROM raw_materials
+        ) m
+        """
+    ).fetchone()
     conn.close()
+
+    stats = {
+        "total_products": int((row["total_products"] if row else 0) or 0),
+        "metal_products": int((row["metal_products"] if row else 0) or 0),
+        "ahsap_products": int((row["ahsap_products"] if row else 0) or 0),
+        "cam_products": int((row["cam_products"] if row else 0) or 0),
+        "harita_products": int((row["harita_products"] if row else 0) or 0),
+        "mobilya_products": int((row["mobilya_products"] if row else 0) or 0),
+        "products_with_dims": int((row["products_with_dims"] if row else 0) or 0),
+        "products_without_dims": int((row["products_without_dims"] if row else 0) or 0),
+        "total_materials": int((row["total_materials"] if row else 0) or 0),
+        "materials_with_price": int((row["materials_with_price"] if row else 0) or 0),
+    }
+    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    logger.info("[stats] duration_ms=%s", elapsed_ms)
     return stats
 
 
@@ -1375,7 +1473,7 @@ def list_products(
     params = []
 
     if not include_inactive:
-        where_clauses.append("COALESCE(is_active, 1) = 1")
+        where_clauses.append("is_active = 1")
     if kategori:
         where_clauses.append("kategori = ?")
         params.append(kategori)
@@ -1438,7 +1536,7 @@ def get_product(child_sku: str):
     """Tek bir ürünün detaylarını döndürür (hammaddeler dahil)."""
     conn = get_db()
     product = conn.execute(
-        "SELECT * FROM products WHERE child_sku = ? AND COALESCE(is_active, 1) = 1",
+        "SELECT * FROM products WHERE child_sku = ? AND is_active = 1",
         (child_sku,),
     ).fetchone()
     if not product:
@@ -1478,15 +1576,36 @@ def list_product_groups(
     Aynı parent (maliyet şablonu satırı) altındaki ürünler aynı hammadde yapısını paylaşır.
     """
     started_at = time.perf_counter()
+    normalized_search = (search or "").strip()
+    cache_key = build_product_groups_cache_key(
+        kategori=kategori,
+        search=normalized_search,
+        page=page,
+        page_size=page_size,
+    )
+    cached = get_product_groups_cache(cache_key)
+    if cached is not None:
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        logger.info(
+            "[product-groups] cache_hit=1 total=%s page=%s size=%s filtered_kategori=%s filtered_search=%s duration_ms=%s",
+            cached.get("total", 0),
+            page,
+            page_size,
+            bool(kategori),
+            bool(normalized_search),
+            elapsed_ms,
+        )
+        return cached
+
     conn = get_db()
-    where_clauses = ["COALESCE(is_active, 1) = 1"]
+    where_clauses = ["is_active = 1"]
     params = []
     if kategori:
         where_clauses.append("kategori = ?")
         params.append(kategori)
-    if search:
+    if normalized_search:
         where_clauses.append("LOWER(COALESCE(parent_name, '')) LIKE ?")
-        params.append(f"%{search.strip().lower()}%")
+        params.append(f"%{normalized_search.lower()}%")
     where_sql = "WHERE " + " AND ".join(where_clauses)
 
     identifier_agg_sql = (
@@ -1495,61 +1614,72 @@ def list_product_groups(
         else "GROUP_CONCAT(DISTINCT product_identifier)"
     )
 
-    grouped_sql = f"""
-        SELECT parent_name, kategori,
-               COUNT(*) as variant_count,
-               COUNT(DISTINCT product_identifier) as sub_group_count,
-               {identifier_agg_sql} as product_identifiers,
-               MIN(en) as min_en, MAX(en) as max_en,
-               MIN(boy) as min_boy, MAX(boy) as max_boy,
-               MIN(alan_m2) as min_alan, MAX(alan_m2) as max_alan
-        FROM products
-        {where_sql}
-        GROUP BY parent_name, kategori
-    """
-    total = row_first_value(
-        conn.execute(
-            f"""
-            SELECT COUNT(*)
-            FROM (
-                SELECT 1
-                FROM products
-                {where_sql}
-                GROUP BY parent_name, kategori
-            ) grouped_count
-            """,
-            params,
-        ).fetchone()
-    ) or 0
-
     offset = (page - 1) * page_size
     rows = conn.execute(
         f"""
-        SELECT *
-        FROM ({grouped_sql}) grouped
+        WITH grouped AS (
+            SELECT parent_name, kategori,
+                   COUNT(*) as variant_count,
+                   COUNT(DISTINCT product_identifier) as sub_group_count,
+                   {identifier_agg_sql} as product_identifiers,
+                   MIN(en) as min_en, MAX(en) as max_en,
+                   MIN(boy) as min_boy, MAX(boy) as max_boy,
+                   MIN(alan_m2) as min_alan, MAX(alan_m2) as max_alan
+            FROM products
+            {where_sql}
+            GROUP BY parent_name, kategori
+        )
+        SELECT grouped.*, COUNT(*) OVER() AS total_count
+        FROM grouped
         ORDER BY kategori, parent_name
         LIMIT ? OFFSET ?
         """,
         params + [page_size, offset],
     ).fetchall()
+    total = 0
+    groups: list[dict] = []
+    if rows:
+        groups = [dict(r) for r in rows]
+        total = int(groups[0].get("total_count") or 0)
+        for row in groups:
+            row.pop("total_count", None)
+    elif page > 1:
+        total = row_first_value(
+            conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM (
+                    SELECT 1
+                    FROM products
+                    {where_sql}
+                    GROUP BY parent_name, kategori
+                ) grouped_count
+                """,
+                params,
+            ).fetchone()
+        ) or 0
     conn.close()
-    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-    logger.info(
-        "[product-groups] total=%s page=%s size=%s filtered_kategori=%s filtered_search=%s duration_ms=%s",
-        total,
-        page,
-        page_size,
-        bool(kategori),
-        bool(search),
-        elapsed_ms,
-    )
-    return {
+
+    response = {
         "total": total,
         "page": page,
         "page_size": page_size,
         "total_pages": (total + page_size - 1) // page_size,
-        "groups": [dict(r) for r in rows],
+        "groups": groups,
     }
+    set_product_groups_cache(cache_key, response)
+
+    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    logger.info(
+        "[product-groups] cache_hit=0 total=%s page=%s size=%s filtered_kategori=%s filtered_search=%s duration_ms=%s",
+        response["total"],
+        page,
+        page_size,
+        bool(kategori),
+        bool(normalized_search),
+        elapsed_ms,
+    )
+    return response
 
 
 # ─────────────────────────── RAW MATERIALS ───────────────────────────
@@ -1831,7 +1961,7 @@ def get_kaplama_suggestions(parent_name: str):
     target_rows = conn.execute("""
         SELECT child_sku, child_name, variation_size, kategori
         FROM products
-        WHERE parent_name = ? AND COALESCE(is_active, 1) = 1
+        WHERE parent_name = ? AND is_active = 1
     """, (parent_name,)).fetchall()
     if not target_rows:
         conn.close()
@@ -1845,7 +1975,7 @@ def get_kaplama_suggestions(parent_name: str):
         WHERE pc.assigned = 1
           AND cd.category = 'kaplama'
           AND cd.is_active = 1
-          AND COALESCE(p.is_active, 1) = 1
+          AND p.is_active = 1
           AND p.parent_name <> ?
     """, (parent_name,)).fetchall()
     conn.close()
@@ -1956,7 +2086,7 @@ def get_kaplama_name_suggestions(parent_name: str):
     target_rows = conn.execute("""
         SELECT child_sku, child_name, variation_size, variation_color, kategori
         FROM products
-        WHERE parent_name = ? AND COALESCE(is_active, 1) = 1
+        WHERE parent_name = ? AND is_active = 1
     """, (parent_name,)).fetchall()
     if not target_rows:
         conn.close()
@@ -1970,7 +2100,7 @@ def get_kaplama_name_suggestions(parent_name: str):
         WHERE pc.assigned = 1
           AND cd.category = 'kaplama'
           AND cd.is_active = 1
-          AND COALESCE(p.is_active, 1) = 1
+          AND p.is_active = 1
           AND p.parent_name <> ?
     """, (parent_name,)).fetchall()
     conn.close()
@@ -2170,7 +2300,7 @@ def get_parent_inheritance_prefill(parent_name: str):
             """
             SELECT child_sku, child_name, variation_size, variation_color, alan_m2, kargo_agirlik, kargo_kodu
             FROM products
-            WHERE parent_name = ? AND COALESCE(is_active, 1) = 1
+            WHERE parent_name = ? AND is_active = 1
             """,
             (parent_name,),
         ).fetchall()
@@ -2198,7 +2328,7 @@ def get_parent_inheritance_prefill(parent_name: str):
             FROM product_costs pc
             LEFT JOIN cost_definitions cd ON cd.name = pc.cost_name
             JOIN products p ON p.child_sku = pc.child_sku
-            WHERE p.parent_name = ? AND COALESCE(p.is_active, 1) = 1 AND pc.assigned = 1
+            WHERE p.parent_name = ? AND p.is_active = 1 AND pc.assigned = 1
             """,
             (parent_name,),
         ).fetchall()
@@ -2277,7 +2407,7 @@ def get_parent_inheritance_prefill(parent_name: str):
             FROM product_materials pm
             JOIN raw_materials rm ON rm.id = pm.material_id
             JOIN products p ON p.child_sku = pm.child_sku
-            WHERE p.parent_name = ? AND COALESCE(p.is_active, 1) = 1
+            WHERE p.parent_name = ? AND p.is_active = 1
             """,
             (parent_name,),
         ).fetchall()
@@ -2434,7 +2564,7 @@ def apply_parent_inheritance(req: ParentInheritanceRequest, request: Request):
         """
         SELECT child_sku, child_name, alan_m2, variation_size, variation_color
         FROM products
-        WHERE parent_name = ? AND COALESCE(is_active, 1) = 1
+        WHERE parent_name = ? AND is_active = 1
         """,
         (req.parent_name,)
     ).fetchall()
@@ -2823,7 +2953,7 @@ def export_excel(payload: ExportRequest, request: Request):
                 SELECT child_sku, child_name, variation_color, en, boy,
                        kargo_en, kargo_boy, kargo_yukseklik, kargo_agirlik, kargo_desi
                 FROM products
-                WHERE COALESCE(is_active, 1) = 1
+                WHERE is_active = 1
                   AND child_sku IN ({placeholders})
                 """,
                 sku_chunk,
@@ -2927,7 +3057,7 @@ def export_all(request: Request):
     """Tüm ürünleri export eder."""
     conn = get_db()
     all_rows = conn.execute(
-        "SELECT child_sku FROM products WHERE COALESCE(is_active, 1) = 1 ORDER BY child_sku"
+        "SELECT child_sku FROM products WHERE is_active = 1 ORDER BY child_sku"
     ).fetchall()
     all_skus = [r.get("child_sku") if isinstance(r, dict) else r["child_sku"] for r in all_rows]
     conn.close()
@@ -2963,6 +3093,7 @@ def sync_products(data: ProductSyncRequest, request: Request):
 
     loaded = load_mapped_products(categories=categories, replace_existing=bool(data.replace_existing))
     deactivated = deactivate_cus_products()
+    invalidate_product_groups_cache()
     write_audit_log(
         admin,
         "products.sync",
@@ -2988,6 +3119,8 @@ def deactivate_cus_products_api(request: Request):
     """Child_Code'u CUS ile başlayan ürünleri pasife alır."""
     admin = require_admin_user(request)
     deactivated = deactivate_cus_products()
+    if deactivated:
+        invalidate_product_groups_cache()
     write_audit_log(
         admin,
         "products.deactivate_cus",
@@ -3017,6 +3150,7 @@ def reload_database(request: Request):
 
     count = load_mapped_products()
     deactivated = deactivate_cus_products()
+    invalidate_product_groups_cache()
     load_default_materials()
     sync_cost_definitions_from_template()
     normalize_legacy_gold_silver_names()

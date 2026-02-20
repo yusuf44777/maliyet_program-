@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { getProducts, getProductGroups, exportExcel } from '../api';
 import { CATEGORY_OPTIONS, getCategoryBadgeClass } from '../categoryUtils';
 import toast from 'react-hot-toast';
@@ -27,11 +27,36 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
   });
 
   const [selectedSkus, setSelectedSkus] = useState(new Set());
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const productsAbortRef = useRef(null);
+  const groupsAbortRef = useRef(null);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(filters.search.trim());
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [filters.search]);
+
+  useEffect(() => {
+    return () => {
+      if (productsAbortRef.current) productsAbortRef.current.abort();
+      if (groupsAbortRef.current) groupsAbortRef.current.abort();
+    };
+  }, []);
 
   const fetchProducts = useCallback(async () => {
     setLoading(true);
+    if (productsAbortRef.current) productsAbortRef.current.abort();
+    const controller = new AbortController();
+    productsAbortRef.current = controller;
     try {
-      const params = { ...filters, page: pagination.page, page_size: pagination.page_size };
+      const params = {
+        ...filters,
+        search: debouncedSearch,
+        page: pagination.page,
+        page_size: pagination.page_size,
+      };
       // Temizle boş parametreleri
       Object.keys(params).forEach(k => {
         if (params[k] === '' || params[k] === null) delete params[k];
@@ -40,7 +65,8 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
       else if (params.has_dims === 'false') params.has_dims = false;
       else delete params.has_dims;
 
-      const data = await getProducts(params);
+      const data = await getProducts(params, { signal: controller.signal });
+      if (controller.signal.aborted) return;
       setProducts(data.products);
       setPagination(prev => ({
         ...prev,
@@ -49,22 +75,38 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
         page_size: data.page_size || prev.page_size,
       }));
     } catch (err) {
+      if (err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError') return;
       toast.error('Ürünler yüklenemedi');
+    } finally {
+      if (productsAbortRef.current === controller) {
+        productsAbortRef.current = null;
+        setLoading(false);
+      }
     }
-    setLoading(false);
-  }, [filters, pagination.page, pagination.page_size]);
+  }, [
+    filters.kategori,
+    filters.has_dims,
+    filters.product_identifier,
+    debouncedSearch,
+    pagination.page,
+    pagination.page_size,
+  ]);
 
   const fetchGroups = useCallback(async () => {
     setGroupsLoading(true);
+    if (groupsAbortRef.current) groupsAbortRef.current.abort();
+    const controller = new AbortController();
+    groupsAbortRef.current = controller;
     try {
       const params = {
         page: groupPagination.page,
         page_size: groupPagination.page_size,
       };
       if (filters.kategori) params.kategori = filters.kategori;
-      if (filters.search?.trim()) params.search = filters.search.trim();
+      if (debouncedSearch) params.search = debouncedSearch;
 
-      const data = await getProductGroups(params);
+      const data = await getProductGroups(params, { signal: controller.signal });
+      if (controller.signal.aborted) return;
       if (Array.isArray(data)) {
         setGroups(data);
         setGroupPagination(prev => ({
@@ -82,10 +124,15 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
         }));
       }
     } catch (err) {
+      if (err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError') return;
       toast.error('Gruplar yüklenemedi');
+    } finally {
+      if (groupsAbortRef.current === controller) {
+        groupsAbortRef.current = null;
+        setGroupsLoading(false);
+      }
     }
-    setGroupsLoading(false);
-  }, [filters.kategori, filters.search, groupPagination.page, groupPagination.page_size]);
+  }, [filters.kategori, debouncedSearch, groupPagination.page, groupPagination.page_size]);
 
   useEffect(() => {
     fetchProducts();
