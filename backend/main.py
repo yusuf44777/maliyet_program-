@@ -37,7 +37,7 @@ from database import (
     deactivate_shadowed_kaplama_base_names, deactivate_cus_products,
     resolve_template_path,
     normalize_product_categories, get_supported_categories,
-    DB_BACKEND, DATABASE_URL,
+    DB_BACKEND, DATABASE_URL, DATABASE_IS_SUPABASE_DIRECT, get_database_diagnostics,
     IntegrityError as DBIntegrityError,
 )
 from models import (
@@ -999,6 +999,11 @@ def _do_startup():
         return
     try:
         logger.info("[startup] başlatılıyor...")
+        if IS_VERCEL and DATABASE_IS_SUPABASE_DIRECT:
+            logger.warning(
+                "[startup] Vercel serverless + Supabase direct DB host tespit edildi. "
+                "Transaction Pooler URL'si (`pooler.supabase.com:6543`) kullanılmalı."
+            )
         validate_runtime_security()
         init_db()
         logger.info("[startup] init_db tamamlandı")
@@ -1106,6 +1111,7 @@ def health_check():
         "enable_approval_workflow": ENABLE_APPROVAL_WORKFLOW,
         "supported_categories": get_supported_categories(),
         "cors_origins": ALLOWED_CORS_ORIGINS,
+        **get_database_diagnostics(),
     }
     if _startup_error:
         info["startup_error"] = _startup_error

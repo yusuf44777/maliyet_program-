@@ -9,8 +9,10 @@ import math
 import re
 import os
 import threading
+import logging
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 try:
     import psycopg2
@@ -47,12 +49,59 @@ if psycopg2 is None:
 
 from storage_utils import is_http_url, cache_remote_file
 
+logger = logging.getLogger("maliyet.db")
+
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL.startswith(("postgres://", "postgresql://")):
     raise RuntimeError(
         "DATABASE_URL zorunlu ve PostgreSQL formatında olmalı. "
         "Örnek: postgresql://USER:PASSWORD@HOST:PORT/DB?sslmode=require"
     )
+
+
+def _parse_database_url_metadata(url: str) -> dict[str, Any]:
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").strip().lower()
+        port = parsed.port
+    except Exception:
+        host = ""
+        port = None
+
+    is_supabase_pooler = host.endswith(".pooler.supabase.com")
+    is_supabase_direct = host.startswith("db.") and host.endswith(".supabase.co")
+    is_supabase = is_supabase_pooler or host.endswith(".supabase.co")
+
+    if port is None:
+        if is_supabase_pooler:
+            port = 6543
+        elif is_supabase_direct:
+            port = 5432
+
+    if is_supabase_pooler:
+        url_kind = "supabase_pooler"
+    elif is_supabase_direct:
+        url_kind = "supabase_direct"
+    else:
+        url_kind = "postgres"
+
+    return {
+        "host": host,
+        "port": port,
+        "is_supabase": is_supabase,
+        "is_supabase_pooler": is_supabase_pooler,
+        "is_supabase_direct": is_supabase_direct,
+        "url_kind": url_kind,
+    }
+
+
+_database_url_metadata = _parse_database_url_metadata(DATABASE_URL)
+DATABASE_HOST = _database_url_metadata["host"]
+DATABASE_PORT = _database_url_metadata["port"]
+DATABASE_IS_SUPABASE = _database_url_metadata["is_supabase"]
+DATABASE_IS_SUPABASE_POOLER = _database_url_metadata["is_supabase_pooler"]
+DATABASE_IS_SUPABASE_DIRECT = _database_url_metadata["is_supabase_direct"]
+DATABASE_URL_KIND = _database_url_metadata["url_kind"]
 DB_BACKEND = "postgres"
 IS_POSTGRES = True
 IntegrityError = PgIntegrityError if PgIntegrityError is not None else Exception
@@ -105,14 +154,20 @@ def close_pg_pool():
         pool.closeall()
 
 
+def _reset_pg_pool():
+    """Bozuk/stale pool'u tamamen kapatıp sıfırlar."""
+    close_pg_pool()
+
+
 def _acquire_healthy_pooled_conn(pool):
     """
     Havuzdan bağlantı alırken stale/broken bağlantıyı eleyip yeniden dener.
     """
     last_error = None
     for _ in range(2):
-        raw_conn = pool.getconn()
+        raw_conn = None
         try:
+            raw_conn = pool.getconn()
             cur = raw_conn.cursor()
             try:
                 cur.execute("SELECT 1")
@@ -137,6 +192,33 @@ def _acquire_healthy_pooled_conn(pool):
     if last_error:
         raise last_error
     raise RuntimeError("PostgreSQL connection pool: sağlıklı bağlantı alınamadı")
+
+
+def _create_raw_connection():
+    try:
+        return psycopg2.connect(DATABASE_URL, connect_timeout=PG_CONNECT_TIMEOUT)
+    except TypeError:
+        # psycopg3 compat wrapper sadece dsn parametresi alıyor.
+        return psycopg2.connect(DATABASE_URL)
+
+
+def _set_connection_autocommit(raw_conn):
+    try:
+        raw_conn.autocommit = False
+    except Exception:
+        pass
+    return raw_conn
+
+
+def get_database_diagnostics() -> dict[str, Any]:
+    return {
+        "database_url_kind": DATABASE_URL_KIND,
+        "database_port": DATABASE_PORT,
+        "database_uses_supabase": DATABASE_IS_SUPABASE,
+        "database_uses_supabase_pooler": DATABASE_IS_SUPABASE_POOLER,
+        "database_uses_supabase_direct": DATABASE_IS_SUPABASE_DIRECT,
+        "pg_pool_enabled": bool(PG_POOL_ENABLED and ThreadedConnectionPool is not None),
+    }
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent  # maliyet_programı root
@@ -439,25 +521,50 @@ def get_db():
     if psycopg2 is None:
         raise RuntimeError("PostgreSQL driver yüklenemedi. 'psycopg2-binary' kurulmalı.")
 
-    pool = _get_or_create_pg_pool()
-    if pool is not None:
-        raw_conn = _acquire_healthy_pooled_conn(pool)
-        try:
-            raw_conn.autocommit = False
-        except Exception:
-            pass
-        return PGCompatConnection(raw_conn, pool=pool)
+    last_error = None
 
-    try:
-        raw_conn = psycopg2.connect(DATABASE_URL, connect_timeout=PG_CONNECT_TIMEOUT)
-    except TypeError:
-        # psycopg3 compat wrapper sadece dsn parametresi alıyor.
-        raw_conn = psycopg2.connect(DATABASE_URL)
-    try:
-        raw_conn.autocommit = False
-    except Exception:
-        pass  # psycopg3 compat: autocommit zaten connect()'te ayarlandı
-    return PGCompatConnection(raw_conn)
+    if PG_POOL_ENABLED and ThreadedConnectionPool is not None:
+        for attempt in range(2):
+            try:
+                pool = _get_or_create_pg_pool()
+                if pool is None:
+                    break
+                raw_conn = _set_connection_autocommit(_acquire_healthy_pooled_conn(pool))
+                return PGCompatConnection(raw_conn, pool=pool)
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "PostgreSQL pooled connection attempt %s/2 failed (%s:%s): %s",
+                    attempt + 1,
+                    DATABASE_URL_KIND,
+                    DATABASE_PORT,
+                    exc,
+                )
+                _reset_pg_pool()
+
+        logger.warning(
+            "PostgreSQL pool reset edildi; direct connection fallback deneniyor (%s:%s)",
+            DATABASE_URL_KIND,
+            DATABASE_PORT,
+        )
+
+    for attempt in range(2):
+        try:
+            raw_conn = _set_connection_autocommit(_create_raw_connection())
+            return PGCompatConnection(raw_conn)
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "PostgreSQL direct connection attempt %s/2 failed (%s:%s): %s",
+                attempt + 1,
+                DATABASE_URL_KIND,
+                DATABASE_PORT,
+                exc,
+            )
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("PostgreSQL bağlantısı kurulamadı")
 
 
 def parse_dims(dims_str: str) -> tuple[float | None, float | None]:
