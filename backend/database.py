@@ -999,13 +999,14 @@ def load_mapped_products(
             status_by_sku[sku] = normalized_status
 
     if replace_existing:
+        placeholders = ", ".join(["?"] * len(selected_categories))
         existing_status_rows = cursor.execute(
-            """
+            f"""
             SELECT child_sku, ham_maliyet_status
             FROM products
-            WHERE kategori = ANY(%s)
+            WHERE kategori IN ({placeholders})
             """,
-            (selected_categories,),
+            selected_categories,
         ).fetchall()
         for row in existing_status_rows:
             sku = str(row["child_sku"] or "").strip()

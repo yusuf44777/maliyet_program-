@@ -1756,6 +1756,75 @@ def list_products(
     }
 
 
+@app.put("/api/products/{child_sku}/raw-cost-status")
+def update_product_raw_cost_status(
+    child_sku: str,
+    payload: ProductRawCostStatusUpdate,
+    request: Request,
+):
+    user = require_request_user(request)
+    normalized_status = normalize_raw_cost_status(payload.status)
+    normalized_sku = str(child_sku or "").strip()
+    if not normalized_sku:
+        raise HTTPException(status_code=400, detail="Geçersiz child_sku")
+
+    conn = get_db()
+    try:
+        existing = conn.execute(
+            """
+            SELECT child_sku
+            FROM products
+            WHERE child_sku = ?
+            """,
+            (normalized_sku,),
+        ).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Ürün bulunamadı")
+
+        conn.execute(
+            """
+            UPDATE products
+            SET ham_maliyet_status = ?
+            WHERE child_sku = ?
+            """,
+            (normalized_status, normalized_sku),
+        )
+        updated = conn.execute(
+            """
+            SELECT child_sku, ham_maliyet_status
+            FROM products
+            WHERE child_sku = ?
+            """,
+            (normalized_sku,),
+        ).fetchone()
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+        raise
+    conn.close()
+
+    write_audit_log(
+        user,
+        "products.raw_cost_status.update",
+        target=normalized_sku,
+        details={
+            "child_sku": normalized_sku,
+            "ham_maliyet_status": normalized_status,
+        },
+    )
+    return {
+        "status": "ok",
+        "product": {
+            "child_sku": updated["child_sku"],
+            "ham_maliyet_status": updated["ham_maliyet_status"],
+        },
+    }
+
+
 @app.get("/api/products/{child_sku}")
 def get_product(child_sku: str):
     """Tek bir ürünün detaylarını döndürür (hammaddeler dahil)."""
@@ -2298,6 +2367,7 @@ def set_product_material(entry: ProductMaterialEntry):
         VALUES (?, ?, ?)
         ON CONFLICT(child_sku, material_id) DO UPDATE SET quantity = ?
     """, (entry.child_sku, entry.material_id, entry.quantity, entry.quantity))
+    set_products_raw_cost_status(conn, [entry.child_sku], RAW_COST_STATUS_DONE)
     conn.commit()
     conn.close()
     return {"status": "ok"}
@@ -2316,6 +2386,7 @@ def set_product_material_bulk(entry: ProductMaterialBulk):
             VALUES (?, ?, ?)
             ON CONFLICT(child_sku, material_id) DO UPDATE SET quantity = ?
         """, (sku, entry.material_id, entry.quantity, entry.quantity))
+    set_products_raw_cost_status(conn, entry.child_skus, RAW_COST_STATUS_DONE)
     conn.commit()
     conn.close()
     return {"status": "ok", "updated": len(entry.child_skus)}
@@ -2912,6 +2983,7 @@ def apply_cost_propagation(data: CostPropagationRequest, request: Request):
                     for sku in child_skus
                 ],
             )
+            set_products_raw_cost_status(conn, child_skus, RAW_COST_STATUS_DONE)
 
         conn.commit()
     except HTTPException:
@@ -3215,6 +3287,7 @@ def _apply_parent_inheritance_core(
     skipped_children_count = 0
     updated_children_sample: list[dict] = []
     skipped_children_sample: list[dict] = []
+    updated_child_skus: list[str] = []
     product_updates: list[tuple] = []
     material_upserts: list[tuple] = []
     cost_upserts: list[tuple] = []
@@ -3403,6 +3476,7 @@ def _apply_parent_inheritance_core(
                 child_result["mdf"] = mdf_qty
 
         updated_children_count += 1
+        updated_child_skus.append(sku)
         if inherit_detail_limit > 0 and len(updated_children_sample) < inherit_detail_limit:
             updated_children_sample.append(child_result)
 
@@ -3440,6 +3514,9 @@ def _apply_parent_inheritance_core(
             """,
             cost_upserts,
         )
+
+    if updated_child_skus:
+        set_products_raw_cost_status(conn, updated_child_skus, RAW_COST_STATUS_DONE)
 
     return {
         "status": "ok",
@@ -4087,6 +4164,20 @@ def reload_database(request: Request):
         raise HTTPException(status_code=403, detail="reload-db production ortamında kapalı")
     admin = require_admin_user(request)
     conn = get_db()
+    preserved_raw_cost_statuses: dict[str, str] = {}
+    status_rows = conn.execute(
+        """
+        SELECT child_sku, ham_maliyet_status
+        FROM products
+        WHERE COALESCE(TRIM(ham_maliyet_status), '') <> ''
+        """
+    ).fetchall()
+    for row in status_rows:
+        sku = str(row["child_sku"] or "").strip()
+        status = str(row["ham_maliyet_status"] or "").strip().lower()
+        if not sku or status not in RAW_COST_STATUS_VALUES:
+            continue
+        preserved_raw_cost_statuses[sku] = status
     conn.execute("DELETE FROM product_materials")
     conn.execute("DELETE FROM product_costs")
     conn.execute("DELETE FROM product_cost_breakdowns")
@@ -4097,7 +4188,7 @@ def reload_database(request: Request):
     conn.commit()
     conn.close()
 
-    count = load_mapped_products()
+    count = load_mapped_products(preserved_raw_cost_statuses=preserved_raw_cost_statuses)
     deactivated = deactivate_cus_products()
     invalidate_product_groups_cache()
     load_default_materials()

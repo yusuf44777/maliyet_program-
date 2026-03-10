@@ -62,6 +62,8 @@ export const getStats = () => api.get('/stats').then(r => r.data);
 export const getProducts = (params, options = {}) =>
   api.get('/products', { params, ...options }).then(r => r.data);
 export const getProduct = (sku) => api.get(`/products/${encodeURIComponent(sku)}`).then(r => r.data);
+export const updateProductRawCostStatus = (sku, data) =>
+  api.put(`/products/${encodeURIComponent(sku)}/raw-cost-status`, data).then(r => r.data);
 export const getProductGroups = (paramsOrKategori, options = {}) => {
   const params = typeof paramsOrKategori === 'string'
     ? (paramsOrKategori ? { kategori: paramsOrKategori } : {})

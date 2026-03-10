@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { getProducts, getProductGroups, exportExcel } from '../api';
+import { getProducts, getProductGroups, exportExcel, updateProductRawCostStatus } from '../api';
 import { CATEGORY_OPTIONS, getCategoryBadgeClass } from '../categoryUtils';
 import toast from 'react-hot-toast';
 import {
@@ -9,6 +9,14 @@ import {
 import HelpTip from './HelpTip';
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100];
+const RAW_COST_STATUS_OPTIONS = [
+  { value: 'calisilmadi', label: 'Çalışılmadı' },
+  { value: 'calisildi', label: 'Çalışıldı' },
+];
+
+function getRawCostStatusValue(value) {
+  return value === 'calisildi' ? 'calisildi' : 'calisilmadi';
+}
 
 export default function ProductBrowser({ onSelectProduct, onRefresh }) {
   const [products, setProducts] = useState([]);
@@ -29,6 +37,7 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
 
   const [selectedSkus, setSelectedSkus] = useState(new Set());
   const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [statusSavingSkus, setStatusSavingSkus] = useState({});
   const productsAbortRef = useRef(null);
   const groupsAbortRef = useRef(null);
 
@@ -170,6 +179,43 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
       setSelectedSkus(new Set());
     } else {
       setSelectedSkus(new Set(products.map(p => p.child_sku)));
+    }
+  };
+
+  const handleRawCostStatusChange = async (sku, nextStatus, currentStatus) => {
+    const normalizedNextStatus = getRawCostStatusValue(nextStatus);
+    const normalizedCurrentStatus = getRawCostStatusValue(currentStatus);
+    if (normalizedNextStatus === normalizedCurrentStatus) return;
+
+    setStatusSavingSkus(prev => ({ ...prev, [sku]: true }));
+    setProducts(prev => prev.map(product => (
+      product.child_sku === sku
+        ? { ...product, ham_maliyet_status: normalizedNextStatus }
+        : product
+    )));
+
+    try {
+      const result = await updateProductRawCostStatus(sku, { status: normalizedNextStatus });
+      const savedStatus = getRawCostStatusValue(result?.product?.ham_maliyet_status);
+      setProducts(prev => prev.map(product => (
+        product.child_sku === sku
+          ? { ...product, ham_maliyet_status: savedStatus }
+          : product
+      )));
+      toast.success('Ham maliyet durumu güncellendi');
+    } catch (err) {
+      setProducts(prev => prev.map(product => (
+        product.child_sku === sku
+          ? { ...product, ham_maliyet_status: normalizedCurrentStatus }
+          : product
+      )));
+      toast.error('Ham maliyet durumu güncellenemedi');
+    } finally {
+      setStatusSavingSkus(prev => {
+        const next = { ...prev };
+        delete next[sku];
+        return next;
+      });
     }
   };
 
@@ -412,6 +458,7 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
                     <th>SKU</th>
                     <th>Ürün Adı</th>
                     <th>Kategori</th>
+                    <th>Ham Maliyet</th>
                     <th>Kod</th>
                     <th>En (cm)</th>
                     <th>Boy (cm)</th>
@@ -424,13 +471,13 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
                 <tbody>
                   {loading ? (
                     <tr>
-                      <td colSpan={11} className="text-center py-8 text-gray-400">
+                      <td colSpan={12} className="text-center py-8 text-gray-400">
                         Yükleniyor...
                       </td>
                     </tr>
                   ) : products.length === 0 ? (
                     <tr>
-                      <td colSpan={11} className="text-center py-8 text-gray-400">
+                      <td colSpan={12} className="text-center py-8 text-gray-400">
                         Ürün bulunamadı
                       </td>
                     </tr>
@@ -451,6 +498,28 @@ export default function ProductBrowser({ onSelectProduct, onRefresh }) {
                           <span className={`badge ${getCategoryBadgeClass(p.kategori)}`}>
                             {p.kategori}
                           </span>
+                        </td>
+                        <td>
+                          <select
+                            value={getRawCostStatusValue(p.ham_maliyet_status)}
+                            onChange={e => handleRawCostStatusChange(
+                              p.child_sku,
+                              e.target.value,
+                              p.ham_maliyet_status,
+                            )}
+                            disabled={Boolean(statusSavingSkus[p.child_sku])}
+                            className={`min-w-[116px] rounded-md border px-2 py-1 text-xs font-medium focus:outline-none focus:ring-2 focus:ring-blue-500 ${
+                              getRawCostStatusValue(p.ham_maliyet_status) === 'calisildi'
+                                ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                : 'border-slate-200 bg-slate-50 text-slate-600'
+                            } disabled:cursor-not-allowed disabled:opacity-60`}
+                          >
+                            {RAW_COST_STATUS_OPTIONS.map(option => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
                         </td>
                         <td className="font-mono">{p.child_code}</td>
                         <td className="text-right font-mono">{p.en ?? '—'}</td>
