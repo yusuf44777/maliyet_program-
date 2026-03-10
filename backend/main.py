@@ -43,6 +43,7 @@ from database import (
 from models import (
     ProductResponse, RawMaterialResponse, RawMaterialUpdate, RawMaterialCreate,
     ProductMaterialEntry, ProductMaterialBulk, ProductCostAssignment,
+    ProductRawCostStatusUpdate,
     ExportRequest, StatsResponse, ParentInheritanceRequest,
     ProductSyncRequest, ApprovalReviewRequest,
     CostDefinitionCreate, CostDefinitionUpdate,
@@ -110,6 +111,9 @@ PRODUCT_GROUPS_CACHE_TTL_SECONDS = max(0, int(os.getenv("PRODUCT_GROUPS_CACHE_TT
 PRODUCT_GROUPS_CACHE_MAX_ITEMS = max(10, int(os.getenv("PRODUCT_GROUPS_CACHE_MAX_ITEMS", "256")))
 _product_groups_cache: dict[str, tuple[float, dict]] = {}
 _product_groups_cache_lock = threading.Lock()
+RAW_COST_STATUS_DONE = "calisildi"
+RAW_COST_STATUS_NOT_DONE = "calisilmadi"
+RAW_COST_STATUS_VALUES = {RAW_COST_STATUS_DONE, RAW_COST_STATUS_NOT_DONE}
 
 app.add_middleware(
     CORSMiddleware,
@@ -340,6 +344,41 @@ def normalize_cost_name_list(value, canonicalize_kaplama: bool = False) -> list[
         seen.add(key)
         out.append(name)
     return out
+
+
+def normalize_raw_cost_status(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized not in RAW_COST_STATUS_VALUES:
+        allowed = ", ".join(sorted(RAW_COST_STATUS_VALUES))
+        raise HTTPException(status_code=400, detail=f"Geçersiz ham maliyet statüsü. Beklenen: {allowed}")
+    return normalized
+
+
+def set_products_raw_cost_status(conn, child_skus: list[str], status: str = RAW_COST_STATUS_DONE) -> int:
+    normalized_status = normalize_raw_cost_status(status)
+    normalized_skus: list[str] = []
+    seen: set[str] = set()
+    for raw_sku in child_skus or []:
+        sku = str(raw_sku or "").strip()
+        if not sku:
+            continue
+        if sku in seen:
+            continue
+        seen.add(sku)
+        normalized_skus.append(sku)
+
+    if not normalized_skus:
+        return 0
+
+    conn.executemany(
+        """
+        UPDATE products
+        SET ham_maliyet_status = ?
+        WHERE child_sku = ?
+        """,
+        [(normalized_status, sku) for sku in normalized_skus],
+    )
+    return len(normalized_skus)
 
 
 def normalize_cost_breakdown_payload(payload: dict | None) -> dict:

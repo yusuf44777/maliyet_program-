@@ -28,6 +28,7 @@ class ProductResponse(BaseModel):
     kargo_yukseklik: Optional[float] = None
     kargo_agirlik: Optional[float] = None
     kargo_desi: Optional[float] = None
+    ham_maliyet_status: Optional[Literal["calisildi", "calisilmadi"]] = None
 
 
 class RawMaterialResponse(BaseModel):
@@ -67,6 +68,10 @@ class ProductCostAssignment(BaseModel):
     child_sku: str
     cost_name: str
     assigned: bool = True
+
+
+class ProductRawCostStatusUpdate(BaseModel):
+    status: Literal["calisildi", "calisilmadi"]
 
 
 class CostDefinitionCreate(BaseModel):

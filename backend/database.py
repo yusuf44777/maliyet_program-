@@ -249,6 +249,7 @@ PRODUCT_EXTRA_COLUMNS = [
     ("kargo_yukseklik", "REAL"),
     ("kargo_agirlik", "REAL"),
     ("kargo_desi", "REAL"),
+    ("ham_maliyet_status", "TEXT"),
     ("is_active", "INTEGER NOT NULL DEFAULT 1"),
 ]
 
@@ -618,6 +619,35 @@ def ensure_products_columns(cursor):
         cursor.execute(f"ALTER TABLE products ADD COLUMN IF NOT EXISTS {col_name} {pg_type}")
 
 
+def backfill_product_raw_cost_status(cursor):
+    """
+    Eski veritabanlarında yeni eklenen ham maliyet statüsünü ilk kez doldurur.
+    Manuel seçimler null olmayacağı için tekrar overwrite edilmez.
+    """
+    cursor.execute(
+        """
+        UPDATE products AS p
+        SET ham_maliyet_status = CASE
+            WHEN EXISTS (
+                SELECT 1
+                FROM product_materials pm
+                WHERE pm.child_sku = p.child_sku
+                  AND COALESCE(pm.quantity, 0) > 0
+            ) THEN 'calisildi'
+            WHEN EXISTS (
+                SELECT 1
+                FROM product_cost_breakdowns pcb
+                WHERE pcb.child_sku = p.child_sku
+            ) THEN 'calisildi'
+            WHEN COALESCE(TRIM(p.kargo_kodu), '') <> '' THEN 'calisildi'
+            WHEN p.kargo_agirlik IS NOT NULL OR p.kargo_desi IS NOT NULL THEN 'calisildi'
+            ELSE 'calisilmadi'
+        END
+        WHERE COALESCE(TRIM(p.ham_maliyet_status), '') = ''
+        """
+    )
+
+
 def ensure_audit_logs_columns(cursor):
     """audit_logs tablosuna izlenebilirlik kolonlarını migrasyonla ekler."""
     columns = [
@@ -726,6 +756,7 @@ def init_db():
             kargo_yukseklik REAL,
             kargo_agirlik REAL,
             kargo_desi REAL,
+            ham_maliyet_status TEXT,
             is_active INTEGER NOT NULL DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -894,6 +925,7 @@ def init_db():
 
     # Sorgu performansı için index paketini uygula
     ensure_indexes(cursor)
+    backfill_product_raw_cost_status(cursor)
 
     conn.commit()
     conn.close()
@@ -943,7 +975,11 @@ def _resolve_kategori_csv_path(kategori_name: str, kategori_dir: Path) -> Path |
     return next((p for p in deduped if p.exists()), None)
 
 
-def load_mapped_products(categories: list[str] | None = None, replace_existing: bool = False):
+def load_mapped_products(
+    categories: list[str] | None = None,
+    replace_existing: bool = False,
+    preserved_raw_cost_statuses: dict[str, str] | None = None,
+):
     """
     mapped product listelerini DB'ye yükler.
     - categories: sadece seçili kategorileri güncelle
@@ -952,8 +988,32 @@ def load_mapped_products(categories: list[str] | None = None, replace_existing: 
     selected_categories = normalize_product_categories(categories)
     conn = get_db()
     cursor = conn.cursor()
+    status_by_sku: dict[str, str] = {}
+
+    if preserved_raw_cost_statuses:
+        for child_sku, status in preserved_raw_cost_statuses.items():
+            sku = str(child_sku or "").strip()
+            normalized_status = str(status or "").strip().lower()
+            if not sku or normalized_status not in {"calisildi", "calisilmadi"}:
+                continue
+            status_by_sku[sku] = normalized_status
 
     if replace_existing:
+        existing_status_rows = cursor.execute(
+            """
+            SELECT child_sku, ham_maliyet_status
+            FROM products
+            WHERE kategori = ANY(%s)
+            """,
+            (selected_categories,),
+        ).fetchall()
+        for row in existing_status_rows:
+            sku = str(row["child_sku"] or "").strip()
+            normalized_status = str(row["ham_maliyet_status"] or "").strip().lower()
+            if not sku or normalized_status not in {"calisildi", "calisilmadi"}:
+                continue
+            status_by_sku.setdefault(sku, normalized_status)
+
         for kategori_name in selected_categories:
             cursor.execute(
                 "DELETE FROM product_materials WHERE child_sku IN (SELECT child_sku FROM products WHERE kategori = ?)",
@@ -1000,6 +1060,7 @@ def load_mapped_products(categories: list[str] | None = None, replace_existing: 
             en, boy = parse_dims(child_dims) if child_dims else (None, None)
             alan = calculate_alan(en, boy)
             is_active = 0 if str(child_code or "").strip().upper().startswith("CUS") else 1
+            ham_maliyet_status = status_by_sku.get(child_sku, "calisilmadi")
             values = (
                 kategori_name,
                 row.get("Parent_ID"),
@@ -1016,6 +1077,7 @@ def load_mapped_products(categories: list[str] | None = None, replace_existing: 
                 product_identifier,
                 match_score,
                 match_method,
+                ham_maliyet_status,
                 is_active,
             )
 
@@ -1025,8 +1087,8 @@ def load_mapped_products(categories: list[str] | None = None, replace_existing: 
                     (kategori, parent_id, parent_name, child_sku, child_name,
                      child_code, child_dims, en, boy, alan_m2,
                      variation_size, variation_color, product_identifier,
-                     match_score, match_method, is_active)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     match_score, match_method, ham_maliyet_status, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (child_sku) DO UPDATE SET
                         kategori = EXCLUDED.kategori,
                         parent_id = EXCLUDED.parent_id,
