@@ -107,7 +107,7 @@ ENABLE_STARTUP_TEMPLATE_SYNC = env_flag(
     "ENABLE_STARTUP_TEMPLATE_SYNC",
     default=(not IS_PRODUCTION and not IS_VERCEL),
 )
-PRODUCT_GROUPS_CACHE_TTL_SECONDS = max(0, int(os.getenv("PRODUCT_GROUPS_CACHE_TTL_SECONDS", "45")))
+PRODUCT_GROUPS_CACHE_TTL_SECONDS = max(0, int(os.getenv("PRODUCT_GROUPS_CACHE_TTL_SECONDS", "120" if IS_PRODUCTION or IS_VERCEL else "45")))
 PRODUCT_GROUPS_CACHE_MAX_ITEMS = max(10, int(os.getenv("PRODUCT_GROUPS_CACHE_MAX_ITEMS", "256")))
 _product_groups_cache: dict[str, tuple[float, dict]] = {}
 _product_groups_cache_lock = threading.Lock()
@@ -239,6 +239,9 @@ def set_product_groups_cache(cache_key: str, payload: dict):
 def invalidate_product_groups_cache():
     with _product_groups_cache_lock:
         _product_groups_cache.clear()
+    with _stats_cache_lock:
+        _stats_cache["data"] = None
+        _stats_cache["expires_at"] = 0.0
 
 
 def validate_runtime_security():
@@ -1540,77 +1543,35 @@ def review_approval(
 def quality_report(request: Request):
     """
     Veri kalite güvencesi için temel bütünlük kontrollerini raporlar.
+    Tüm kontroller tek sorguda yapılır (Supabase latency optimizasyonu).
     """
     require_admin_user(request)
     conn = get_db()
-    checks = {
-        "orphan_product_materials": row_first_value(conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM product_materials pm
-            LEFT JOIN products p ON p.child_sku = pm.child_sku
-            WHERE p.child_sku IS NULL
-            """
-        ).fetchone()) or 0,
-        "orphan_product_costs": row_first_value(conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM product_costs pc
-            LEFT JOIN products p ON p.child_sku = pc.child_sku
-            WHERE p.child_sku IS NULL
-            """
-        ).fetchone()) or 0,
-        "assigned_costs_without_definition": row_first_value(conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM product_costs pc
-            LEFT JOIN cost_definitions cd ON cd.name = pc.cost_name
-            WHERE pc.assigned = 1 AND cd.id IS NULL
-            """
-        ).fetchone()) or 0,
-        "assigned_costs_inactive_definition": row_first_value(conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM product_costs pc
-            JOIN cost_definitions cd ON cd.name = pc.cost_name
-            WHERE pc.assigned = 1 AND COALESCE(cd.is_active, 1) = 0
-            """
-        ).fetchone()) or 0,
-        "products_missing_parent_name": row_first_value(conn.execute(
-            "SELECT COUNT(*) FROM products WHERE parent_name IS NULL OR TRIM(parent_name) = ''"
-        ).fetchone()) or 0,
-        "products_missing_identifier": row_first_value(conn.execute(
-            "SELECT COUNT(*) FROM products WHERE product_identifier IS NULL OR TRIM(product_identifier) = ''"
-        ).fetchone()) or 0,
-        "products_missing_variation_size": row_first_value(conn.execute(
-            "SELECT COUNT(*) FROM products WHERE variation_size IS NULL OR TRIM(variation_size) = ''"
-        ).fetchone()) or 0,
-        "duplicate_users_case_insensitive": row_first_value(conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM (
-                SELECT LOWER(username) AS k, COUNT(*) AS c
-                FROM users
-                GROUP BY LOWER(username)
-                HAVING COUNT(*) > 1
-            ) t
-            """
-        ).fetchone()) or 0,
-        "duplicate_cost_names_case_insensitive": row_first_value(conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM (
-                SELECT LOWER(name) AS k, COUNT(*) AS c
-                FROM cost_definitions
-                GROUP BY LOWER(name)
-                HAVING COUNT(*) > 1
-            ) t
-            """
-        ).fetchone()) or 0,
-    }
+    row = conn.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM product_materials pm LEFT JOIN products p ON p.child_sku = pm.child_sku WHERE p.child_sku IS NULL) AS orphan_product_materials,
+            (SELECT COUNT(*) FROM product_costs pc LEFT JOIN products p ON p.child_sku = pc.child_sku WHERE p.child_sku IS NULL) AS orphan_product_costs,
+            (SELECT COUNT(*) FROM product_costs pc LEFT JOIN cost_definitions cd ON cd.name = pc.cost_name WHERE pc.assigned = 1 AND cd.id IS NULL) AS assigned_costs_without_definition,
+            (SELECT COUNT(*) FROM product_costs pc JOIN cost_definitions cd ON cd.name = pc.cost_name WHERE pc.assigned = 1 AND COALESCE(cd.is_active, 1) = 0) AS assigned_costs_inactive_definition,
+            (SELECT COUNT(*) FROM products WHERE parent_name IS NULL OR TRIM(parent_name) = '') AS products_missing_parent_name,
+            (SELECT COUNT(*) FROM products WHERE product_identifier IS NULL OR TRIM(product_identifier) = '') AS products_missing_identifier,
+            (SELECT COUNT(*) FROM products WHERE variation_size IS NULL OR TRIM(variation_size) = '') AS products_missing_variation_size,
+            (SELECT COUNT(*) FROM (SELECT LOWER(username) AS k, COUNT(*) AS c FROM users GROUP BY LOWER(username) HAVING COUNT(*) > 1) t) AS duplicate_users_case_insensitive,
+            (SELECT COUNT(*) FROM (SELECT LOWER(name) AS k, COUNT(*) AS c FROM cost_definitions GROUP BY LOWER(name) HAVING COUNT(*) > 1) t) AS duplicate_cost_names_case_insensitive
+        """
+    ).fetchone()
     conn.close()
 
-    issue_count = sum(int(v or 0) for v in checks.values())
+    checks = {k: int(row[k] or 0) for k in [
+        "orphan_product_materials", "orphan_product_costs",
+        "assigned_costs_without_definition", "assigned_costs_inactive_definition",
+        "products_missing_parent_name", "products_missing_identifier",
+        "products_missing_variation_size",
+        "duplicate_users_case_insensitive", "duplicate_cost_names_case_insensitive",
+    ]} if row else {}
+
+    issue_count = sum(checks.values())
     return {
         "status": "ok" if issue_count == 0 else "warning",
         "issue_count": issue_count,
@@ -1620,9 +1581,24 @@ def quality_report(request: Request):
 
 # ─────────────────────────── STATS ───────────────────────────
 
+_stats_cache: dict = {"data": None, "expires_at": 0.0}
+_stats_cache_lock = threading.Lock()
+STATS_CACHE_TTL_SECONDS = max(0, int(os.getenv("STATS_CACHE_TTL_SECONDS", "30")))
+
+
 @app.get("/api/stats", response_model=StatsResponse)
 def get_stats():
     started_at = time.perf_counter()
+
+    # Server-side cache (remote DB latency azaltmak için)
+    if STATS_CACHE_TTL_SECONDS > 0:
+        now = time.time()
+        with _stats_cache_lock:
+            if _stats_cache["data"] is not None and _stats_cache["expires_at"] > now:
+                elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+                logger.info("[stats] cache_hit=1 duration_ms=%s", elapsed_ms)
+                return _stats_cache["data"]
+
     conn = get_db()
     row = conn.execute(
         """
@@ -1673,7 +1649,13 @@ def get_stats():
         "materials_with_price": int((row["materials_with_price"] if row else 0) or 0),
     }
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-    logger.info("[stats] duration_ms=%s", elapsed_ms)
+    logger.info("[stats] cache_hit=0 duration_ms=%s", elapsed_ms)
+
+    if STATS_CACHE_TTL_SECONDS > 0:
+        with _stats_cache_lock:
+            _stats_cache["data"] = stats
+            _stats_cache["expires_at"] = time.time() + STATS_CACHE_TTL_SECONDS
+
     return stats
 
 
@@ -1718,22 +1700,26 @@ def list_products(
 
     where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
 
-    # Count
-    total = row_first_value(conn.execute(f"SELECT COUNT(*) FROM products WHERE {where_sql}", params).fetchone()) or 0
-
-    # Data
+    # Data + Count tek sorguda (Supabase latency optimizasyonu)
     offset = (page - 1) * page_size
     order_sql = "kategori, product_identifier, child_sku"
-    # Parent detay ekranında en sık kullanılan senaryo: tek parent altında child listesi
-    # Bu senaryoda child_sku sıralaması daha hafif ve indeks dostudur.
     if parent_name and not search and not kategori and not product_identifier:
         order_sql = "child_sku"
     rows = conn.execute(
-        f"SELECT * FROM products WHERE {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?",
+        f"SELECT *, COUNT(*) OVER() AS _total_count FROM products WHERE {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?",
         params + [page_size, offset]
     ).fetchall()
 
-    products = [dict(row) for row in rows]
+    total = 0
+    products = []
+    if rows:
+        total = int(rows[0].get("_total_count") or 0)
+        for row in rows:
+            d = dict(row)
+            d.pop("_total_count", None)
+            products.append(d)
+    elif page > 1:
+        total = row_first_value(conn.execute(f"SELECT COUNT(*) FROM products WHERE {where_sql}", params).fetchone()) or 0
     conn.close()
 
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
@@ -1827,7 +1813,7 @@ def update_product_raw_cost_status(
 
 @app.get("/api/products/{child_sku}")
 def get_product(child_sku: str):
-    """Tek bir ürünün detaylarını döndürür (hammaddeler dahil)."""
+    """Tek bir ürünün detaylarını döndürür (hammaddeler ve maliyetler dahil)."""
     conn = get_db()
     product = conn.execute(
         "SELECT * FROM products WHERE child_sku = ? AND is_active = 1",
@@ -1839,22 +1825,21 @@ def get_product(child_sku: str):
 
     product_dict = dict(product)
 
-    # Hammadde miktarları
+    # Hammadde + maliyet sorgularını tek seferde çek (2 sorgu yerine UNION kullanılamaz
+    # çünkü farklı şemalar, ama en azından tek bağlantıda sırayla)
     materials = conn.execute("""
         SELECT pm.*, rm.name, rm.unit, rm.unit_price, rm.currency
         FROM product_materials pm
         JOIN raw_materials rm ON pm.material_id = rm.id
         WHERE pm.child_sku = ?
     """, (child_sku,)).fetchall()
-    product_dict["materials"] = [dict(m) for m in materials]
-
-    # Maliyet (ambalaj) atamaları
     costs = conn.execute(
         "SELECT * FROM product_costs WHERE child_sku = ?", (child_sku,)
     ).fetchall()
-    product_dict["costs"] = [dict(c) for c in costs]
-
     conn.close()
+
+    product_dict["materials"] = [dict(m) for m in materials]
+    product_dict["costs"] = [dict(c) for c in costs]
     return product_dict
 
 

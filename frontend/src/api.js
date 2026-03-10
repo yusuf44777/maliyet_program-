@@ -45,6 +45,30 @@ api.interceptors.response.use(
   },
 );
 
+// ─── Simple in-memory cache for rarely-changing data ───
+const _cache = {};
+const CACHE_TTL = 60000; // 60 seconds
+
+function cachedGet(key, fetcher) {
+  const now = Date.now();
+  const entry = _cache[key];
+  if (entry && entry.expires > now) return Promise.resolve(entry.data);
+  if (entry && entry.promise) return entry.promise;
+  const promise = fetcher().then(data => {
+    _cache[key] = { data, expires: now + CACHE_TTL, promise: null };
+    return data;
+  }).catch(err => {
+    if (_cache[key]?.promise === promise) delete _cache[key];
+    throw err;
+  });
+  _cache[key] = { ...(entry || {}), promise };
+  return promise;
+}
+
+export function invalidateCache(key) {
+  if (key) { delete _cache[key]; } else { Object.keys(_cache).forEach(k => delete _cache[k]); }
+}
+
 // ─── Auth ───
 export const loginAuth = (data) => api.post('/auth/login', data).then(r => r.data);
 export const getMe = () => api.get('/auth/me').then(r => r.data);
@@ -88,10 +112,10 @@ export const applyParentCostGroupInheritanceAtomic = (groupId, data) =>
   api.post(`/parent-cost-groups/${groupId}/apply-inheritance-atomic`, data).then(r => r.data);
 
 // ─── Materials ───
-export const getMaterials = () => api.get('/materials').then(r => r.data);
-export const createMaterial = (data) => api.post('/materials', data).then(r => r.data);
-export const updateMaterial = (id, data) => api.put(`/materials/${id}`, data).then(r => r.data);
-export const deleteMaterial = (id) => api.delete(`/materials/${id}`).then(r => r.data);
+export const getMaterials = () => cachedGet('materials', () => api.get('/materials').then(r => r.data));
+export const createMaterial = (data) => api.post('/materials', data).then(r => { invalidateCache('materials'); return r.data; });
+export const updateMaterial = (id, data) => api.put(`/materials/${id}`, data).then(r => { invalidateCache('materials'); return r.data; });
+export const deleteMaterial = (id) => api.delete(`/materials/${id}`).then(r => { invalidateCache('materials'); return r.data; });
 
 // ─── Product Materials ───
 export const setProductMaterial = (data) => api.post('/product-materials', data).then(r => r.data);
@@ -100,12 +124,12 @@ export const getProductMaterials = (sku) =>
   api.get(`/product-materials/${encodeURIComponent(sku)}`).then(r => r.data);
 
 // ─── Costs ───
-export const getCostNames = () => api.get('/cost-names').then(r => r.data);
+export const getCostNames = () => cachedGet('cost-names', () => api.get('/cost-names').then(r => r.data));
 export const getCostDefinitions = (params) => api.get('/cost-definitions', { params }).then(r => r.data);
 export const createCostDefinition = (data) => api.post('/cost-definitions', data).then(r => r.data);
 export const updateCostDefinition = (id, data) => api.put(`/cost-definitions/${id}`, data).then(r => r.data);
 export const deleteCostDefinition = (id) => api.delete(`/cost-definitions/${id}`).then(r => r.data);
-export const getKargoOptions = () => api.get('/kargo-options').then(r => r.data);
+export const getKargoOptions = () => cachedGet('kargo-options', () => api.get('/kargo-options').then(r => r.data));
 export const getKaplamaSuggestions = (parentName) =>
   api.get('/kaplama-suggestions', { params: { parent_name: parentName } }).then(r => r.data);
 export const getKaplamaNameSuggestions = (parentName) =>

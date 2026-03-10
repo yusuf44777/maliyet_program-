@@ -117,7 +117,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 PG_POOL_ENABLED = _env_flag("PG_POOL_ENABLED", default=True)
 PG_POOL_MIN_CONN = max(1, int(os.getenv("PG_POOL_MIN_CONN", "1")))
 PG_POOL_MAX_CONN = max(PG_POOL_MIN_CONN, int(os.getenv("PG_POOL_MAX_CONN", "3")))
-PG_CONNECT_TIMEOUT = max(2, int(os.getenv("PG_CONNECT_TIMEOUT", "10")))
+PG_CONNECT_TIMEOUT = max(2, int(os.getenv("PG_CONNECT_TIMEOUT", "5")))
 PG_EXECUTEMANY_PAGE_SIZE = max(50, int(os.getenv("PG_EXECUTEMANY_PAGE_SIZE", "500")))
 _pg_pool = None
 _pg_pool_lock = threading.Lock()
@@ -162,21 +162,25 @@ def _reset_pg_pool():
 def _acquire_healthy_pooled_conn(pool):
     """
     Havuzdan bağlantı alırken stale/broken bağlantıyı eleyip yeniden dener.
+    SELECT 1 health check yalnızca bağlantı hatası durumunda ikinci denemede yapılır.
     """
     last_error = None
-    for _ in range(2):
+    for attempt in range(2):
         raw_conn = None
         try:
             raw_conn = pool.getconn()
-            cur = raw_conn.cursor()
-            try:
-                cur.execute("SELECT 1")
-                _ = cur.fetchone()
-            finally:
+            # İlk denemede health check yapmayarak ~100ms kazanıyoruz.
+            # Sadece ikinci denemede (ilk başarısız olduysa) health check yap.
+            if attempt > 0:
+                cur = raw_conn.cursor()
                 try:
-                    cur.close()
-                except Exception:
-                    pass
+                    cur.execute("SELECT 1")
+                    _ = cur.fetchone()
+                finally:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
             return raw_conn
         except Exception as exc:
             last_error = exc
@@ -704,7 +708,10 @@ def ensure_indexes(cursor):
         "CREATE INDEX IF NOT EXISTS idx_product_costs_cost_name ON product_costs(cost_name)",
         "CREATE INDEX IF NOT EXISTS idx_product_costs_assigned ON product_costs(assigned)",
         "CREATE INDEX IF NOT EXISTS idx_cost_definitions_category_active ON cost_definitions(category, is_active)",
+        "CREATE INDEX IF NOT EXISTS idx_cost_definitions_name ON cost_definitions(name)",
         "CREATE INDEX IF NOT EXISTS idx_cost_definitions_kargo_code ON cost_definitions(kargo_code)",
+        "CREATE INDEX IF NOT EXISTS idx_product_costs_sku_assigned ON product_costs(child_sku, assigned)",
+        "CREATE INDEX IF NOT EXISTS idx_product_costs_assigned_cost ON product_costs(assigned, cost_name)",
         "CREATE INDEX IF NOT EXISTS idx_parent_cost_profiles_parent_id ON parent_cost_profiles(parent_id)",
         "CREATE INDEX IF NOT EXISTS idx_product_cost_breakdowns_parent_id ON product_cost_breakdowns(parent_id)",
         "CREATE INDEX IF NOT EXISTS idx_product_cost_breakdowns_child_sku ON product_cost_breakdowns(child_sku)",

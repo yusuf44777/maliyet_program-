@@ -78,15 +78,14 @@ export default function App() {
     const bootstrap = async () => {
       if (AUTH_DISABLED) {
         try {
-          const res = await getMe();
+          const [res, st] = await Promise.all([
+            getMe().catch(() => null),
+            getStats().catch(() => null),
+          ]);
           setUser(res?.user || OPEN_ACCESS_USER);
-        } catch {
-          setUser(OPEN_ACCESS_USER);
-        }
-        try {
-          const st = await getStats();
           setStats(st);
         } catch {
+          setUser(OPEN_ACCESS_USER);
           setStats(null);
         }
         setAuthLoading(false);
@@ -99,9 +98,11 @@ export default function App() {
         return;
       }
       try {
-        const res = await getMe();
+        const [res, st] = await Promise.all([
+          getMe(),
+          getStats().catch(() => null),
+        ]);
         setUser(res.user);
-        const st = await getStats();
         setStats(st);
       } catch (err) {
         clearAuthToken();
@@ -135,12 +136,7 @@ export default function App() {
     setUser(res.user);
     setActiveTab('dashboard');
     setSelectedProduct(null);
-    try {
-      const st = await getStats();
-      setStats(st);
-    } catch {
-      setStats(null);
-    }
+    getStats().then(setStats).catch(() => setStats(null));
   };
 
   const handleLogout = () => {
