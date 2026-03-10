@@ -2,6 +2,11 @@ import axios from 'axios';
 
 const RAW_API_BASE = (import.meta.env.VITE_API_URL || '').trim();
 const API_BASE = RAW_API_BASE ? RAW_API_BASE.replace(/\/+$/, '') : '/api';
+export const AUTH_DISABLED = (() => {
+  const raw = import.meta.env.VITE_DISABLE_AUTH;
+  if (raw !== undefined) return String(raw).toLowerCase() === 'true';
+  return true;
+})();
 
 const api = axios.create({
   baseURL: API_BASE,
@@ -32,7 +37,7 @@ api.interceptors.response.use(
   (error) => {
     const status = error?.response?.status;
     const url = error?.config?.url || '';
-    if (status === 401 && !url.includes('/auth/login')) {
+    if (!AUTH_DISABLED && status === 401 && !url.includes('/auth/login')) {
       clearAuthToken();
       window.dispatchEvent(new CustomEvent('auth:unauthorized'));
     }

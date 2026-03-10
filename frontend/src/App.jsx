@@ -11,7 +11,16 @@ import LoginScreen from './components/LoginScreen';
 import UserManager from './components/UserManager';
 import HelpTip from './components/HelpTip';
 import UserTutorialModal from './components/UserTutorialModal';
-import { getStats, loginAuth, getMe, changePassword, setAuthToken, clearAuthToken, getAuthToken } from './api';
+import {
+  AUTH_DISABLED,
+  getStats,
+  loginAuth,
+  getMe,
+  changePassword,
+  setAuthToken,
+  clearAuthToken,
+  getAuthToken,
+} from './api';
 import {
   LayoutDashboard,
   Package,
@@ -26,6 +35,15 @@ import {
   BookOpen,
 } from 'lucide-react';
 
+const OPEN_ACCESS_USER = {
+  id: 0,
+  username: 'acik-erisim',
+  role: 'admin',
+  is_active: true,
+  created_at: null,
+  updated_at: null,
+};
+
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [stats, setStats] = useState(null);
@@ -34,7 +52,8 @@ export default function App() {
   const [user, setUser] = useState(null);
   const [tutorialOpen, setTutorialOpen] = useState(false);
 
-  const isAdmin = user?.role === 'admin';
+  const currentUser = user || (AUTH_DISABLED ? OPEN_ACCESS_USER : null);
+  const isAdmin = currentUser?.role === 'admin';
   const tabs = useMemo(() => {
     const base = [
       { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
@@ -57,6 +76,23 @@ export default function App() {
 
   useEffect(() => {
     const bootstrap = async () => {
+      if (AUTH_DISABLED) {
+        try {
+          const res = await getMe();
+          setUser(res?.user || OPEN_ACCESS_USER);
+        } catch {
+          setUser(OPEN_ACCESS_USER);
+        }
+        try {
+          const st = await getStats();
+          setStats(st);
+        } catch {
+          setStats(null);
+        }
+        setAuthLoading(false);
+        return;
+      }
+
       const token = getAuthToken();
       if (!token) {
         setAuthLoading(false);
@@ -77,6 +113,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (AUTH_DISABLED) return undefined;
     const onUnauthorized = () => {
       setUser(null);
       setSelectedProduct(null);
@@ -107,6 +144,7 @@ export default function App() {
   };
 
   const handleLogout = () => {
+    if (AUTH_DISABLED) return;
     clearAuthToken();
     setUser(null);
     setSelectedProduct(null);
@@ -115,6 +153,10 @@ export default function App() {
   };
 
   const handleChangePassword = async () => {
+    if (AUTH_DISABLED) {
+      toast.error('Giriş sistemi kapalı olduğu için parola değiştirme devre dışı');
+      return;
+    }
     const current = window.prompt('Mevcut parola:');
     if (current == null) return;
     const next = window.prompt('Yeni parola (en az 6 karakter):');
@@ -135,7 +177,7 @@ export default function App() {
     );
   }
 
-  if (!user) {
+  if (!currentUser) {
     return (
       <div className="min-h-screen">
         <Toaster position="top-right" />
@@ -201,9 +243,14 @@ export default function App() {
                 isAdmin ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-700'
               }`}>
                 <Shield className="w-3 h-3" />
-                {user.role}
+                {currentUser.role}
               </span>
-              <span className="text-gray-600">{user.username}</span>
+              <span className="text-gray-600">{currentUser.username}</span>
+              {AUTH_DISABLED && (
+                <span className="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-emerald-100 text-emerald-800">
+                  Açık erişim
+                </span>
+              )}
               <button
                 type="button"
                 onClick={() => setTutorialOpen(true)}
@@ -213,22 +260,26 @@ export default function App() {
                 <BookOpen className="w-3 h-3" />
                 Yardım
               </button>
-              <button
-                onClick={handleChangePassword}
-                className="inline-flex items-center gap-1 px-2 py-1 rounded border border-gray-200 text-gray-600 hover:bg-gray-50"
-                title="Parola değiştir"
-              >
-                <KeyRound className="w-3 h-3" />
-                Parola
-              </button>
-              <button
-                onClick={handleLogout}
-                className="inline-flex items-center gap-1 px-2 py-1 rounded border border-gray-200 text-gray-600 hover:bg-gray-50"
-                title="Çıkış yap"
-              >
-                <LogOut className="w-3 h-3" />
-                Çıkış
-              </button>
+              {!AUTH_DISABLED && (
+                <button
+                  onClick={handleChangePassword}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded border border-gray-200 text-gray-600 hover:bg-gray-50"
+                  title="Parola değiştir"
+                >
+                  <KeyRound className="w-3 h-3" />
+                  Parola
+                </button>
+              )}
+              {!AUTH_DISABLED && (
+                <button
+                  onClick={handleLogout}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded border border-gray-200 text-gray-600 hover:bg-gray-50"
+                  title="Çıkış yap"
+                >
+                  <LogOut className="w-3 h-3" />
+                  Çıkış
+                </button>
+              )}
             </div>
           </div>
 
@@ -281,7 +332,7 @@ export default function App() {
           <CostPropagation />
         )}
         {activeTab === 'users' && isAdmin && (
-          <UserManager currentUser={user} />
+          <UserManager currentUser={currentUser} />
         )}
       </main>
     </div>

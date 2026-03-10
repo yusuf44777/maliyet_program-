@@ -140,6 +140,12 @@ KAPLAMA_GOLD_COPPER_TOKENS = {
 AUTH_SECRET = os.getenv("AUTH_SECRET", "maliyet-dev-secret-change-me")
 AUTH_TOKEN_TTL_SECONDS = int(os.getenv("AUTH_TOKEN_TTL_SECONDS", "43200"))  # 12 saat
 AUTH_HASH_ITERATIONS = int(os.getenv("AUTH_HASH_ITERATIONS", "120000"))
+EXPOSE_HEALTH_DETAILS = env_flag("EXPOSE_HEALTH_DETAILS", default=not IS_PRODUCTION)
+DISABLE_AUTH = env_flag("DISABLE_AUTH", default=True)
+AUTH_BYPASS_USERNAME = (os.getenv("AUTH_BYPASS_USERNAME", "acik-erisim").strip() or "acik-erisim")
+AUTH_BYPASS_ROLE = (os.getenv("AUTH_BYPASS_ROLE", "admin").strip().lower() or "admin")
+if AUTH_BYPASS_ROLE not in {"admin", "user"}:
+    AUTH_BYPASS_ROLE = "admin"
 WEAK_AUTH_SECRETS = {
     "",
     "maliyet-dev-secret-change-me",
@@ -233,6 +239,9 @@ def invalidate_product_groups_cache():
 
 def validate_runtime_security():
     if not IS_PRODUCTION:
+        return
+    if DISABLE_AUTH:
+        logger.warning("DISABLE_AUTH=true. API authentication devre dışı; tüm API istekleri bypass kullanıcısıyla çalışacak.")
         return
     secret = str(AUTH_SECRET or "").strip()
     if secret in WEAK_AUTH_SECRETS or len(secret) < 32:
@@ -556,6 +565,17 @@ def serialize_user(row) -> dict | None:
         "is_active": bool(row["is_active"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+    }
+
+
+def get_auth_bypass_user() -> dict:
+    return {
+        "id": 0,
+        "username": AUTH_BYPASS_USERNAME,
+        "role": AUTH_BYPASS_ROLE,
+        "is_active": True,
+        "created_at": None,
+        "updated_at": None,
     }
 
 
@@ -960,6 +980,9 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     if request.method == "OPTIONS":
         return await call_next(request)
+    if DISABLE_AUTH:
+        request.state.user = get_auth_bypass_user()
+        return await call_next(request)
     if path in PUBLIC_API_PATHS or path.rstrip("/") in PUBLIC_API_PATHS:
         return await call_next(request)
 
@@ -1109,11 +1132,12 @@ def health_check():
         "seed_default_users": SEED_DEFAULT_USERS,
         "enable_product_sync": ENABLE_PRODUCT_SYNC,
         "enable_approval_workflow": ENABLE_APPROVAL_WORKFLOW,
+        "auth_disabled": DISABLE_AUTH,
         "supported_categories": get_supported_categories(),
         "cors_origins": ALLOWED_CORS_ORIGINS,
         **get_database_diagnostics(),
     }
-    if _startup_error:
+    if _startup_error and EXPOSE_HEALTH_DETAILS:
         info["startup_error"] = _startup_error
     try:
         conn = get_db()
@@ -1123,7 +1147,8 @@ def health_check():
         info["user_count"] = user_count
         info["product_count"] = product_count
     except Exception as e:
-        info["db_error"] = str(e)
+        if EXPOSE_HEALTH_DETAILS:
+            info["db_error"] = str(e)
     return info
 
 
@@ -1131,6 +1156,17 @@ def health_check():
 
 @app.post("/api/auth/login")
 def login(data: AuthLoginRequest):
+    if DISABLE_AUTH:
+        user = get_auth_bypass_user()
+        token = generate_auth_token(user["id"], user["username"], user["role"])
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_in": AUTH_TOKEN_TTL_SECONDS,
+            "user": user,
+            "auth_disabled": True,
+        }
+
     username = (data.username or "").strip()
     if not username or not data.password:
         raise HTTPException(status_code=400, detail="Kullanıcı adı ve parola zorunlu")
@@ -1168,6 +1204,8 @@ def auth_me(request: Request):
 
 @app.post("/api/auth/change-password")
 def change_password(data: AuthChangePasswordRequest, request: Request):
+    if DISABLE_AUTH:
+        raise HTTPException(status_code=403, detail="Parola değiştirme kapalı; giriş sistemi devre dışı.")
     user = require_request_user(request)
     current_password = data.current_password or ""
     new_password = data.new_password or ""
