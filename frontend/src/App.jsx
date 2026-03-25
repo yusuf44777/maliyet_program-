@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
+import { Routes, Route, Navigate, useNavigate, useLocation, useParams } from 'react-router-dom';
 import { Toaster } from 'react-hot-toast';
 import toast from 'react-hot-toast';
 import Dashboard from './components/Dashboard';
@@ -44,35 +45,75 @@ const OPEN_ACCESS_USER = {
   updated_at: null,
 };
 
+// Route → tab id eşlemesi
+const ROUTE_TO_TAB = {
+  '/': 'dashboard',
+  '/inheritance': 'inheritance',
+  '/products': 'products',
+  '/materials': 'materials',
+  '/cost-propagation': 'cost-propagation',
+  '/users': 'users',
+};
+
+// ProductDetail sarmalayıcı — URL'den sku alır
+function ProductDetailRoute({ onRefresh }) {
+  const { sku } = useParams();
+  const navigate = useNavigate();
+  return (
+    <ProductDetail
+      sku={decodeURIComponent(sku)}
+      onBack={() => navigate('/products')}
+      onRefresh={onRefresh}
+    />
+  );
+}
+
+// Admin route koruması
+function AdminRoute({ isAdmin, children }) {
+  if (!isAdmin) return <Navigate to="/" replace />;
+  return children;
+}
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState('dashboard');
+  const navigate = useNavigate();
+  const location = useLocation();
+
   const [stats, setStats] = useState(null);
-  const [selectedProduct, setSelectedProduct] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [user, setUser] = useState(null);
   const [tutorialOpen, setTutorialOpen] = useState(false);
 
   const currentUser = user || (AUTH_DISABLED ? OPEN_ACCESS_USER : null);
   const isAdmin = currentUser?.role === 'admin';
+
+  // Geçerli path'ten aktif tab'ı hesapla
+  const activeTab = useMemo(() => {
+    const path = location.pathname;
+    if (path.startsWith('/products/')) return 'products';
+    return ROUTE_TO_TAB[path] || 'dashboard';
+  }, [location.pathname]);
+
   const tabs = useMemo(() => {
     const base = [
-      { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
-      { id: 'inheritance', label: 'Maliyet Aktarımı', icon: GitBranch },
-      { id: 'products', label: 'Ürünler', icon: Package },
+      { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, path: '/' },
+      { id: 'inheritance', label: 'Maliyet Aktarımı', icon: GitBranch, path: '/inheritance' },
+      { id: 'products', label: 'Ürünler', icon: Package, path: '/products' },
     ];
     if (isAdmin) {
-      base.push({ id: 'materials', label: 'Hammaddeler', icon: Hammer });
-      base.push({ id: 'cost-propagation', label: 'Maliyet Yayılımı', icon: ArrowRightLeft });
-      base.push({ id: 'users', label: 'Kullanıcılar', icon: Users });
+      base.push({ id: 'materials', label: 'Hammaddeler', icon: Hammer, path: '/materials' });
+      base.push({ id: 'cost-propagation', label: 'Maliyet Yayılımı', icon: ArrowRightLeft, path: '/cost-propagation' });
+      base.push({ id: 'users', label: 'Kullanıcılar', icon: Users, path: '/users' });
     }
     return base;
   }, [isAdmin]);
 
+  // Admin olmayan kullanıcı admin route'taysa ana sayfaya yönlendir
   useEffect(() => {
-    if (!tabs.some(t => t.id === activeTab)) {
-      setActiveTab('dashboard');
+    const adminPaths = ['/materials', '/cost-propagation', '/users'];
+    if (!isAdmin && adminPaths.some(p => location.pathname.startsWith(p))) {
+      navigate('/', { replace: true });
     }
-  }, [tabs, activeTab]);
+  }, [isAdmin, location.pathname, navigate]);
 
   useEffect(() => {
     const bootstrap = async () => {
@@ -117,14 +158,13 @@ export default function App() {
     if (AUTH_DISABLED) return undefined;
     const onUnauthorized = () => {
       setUser(null);
-      setSelectedProduct(null);
-      setActiveTab('dashboard');
       setStats(null);
       toast.error('Oturum süresi doldu, tekrar giriş yapın');
+      navigate('/login', { replace: true });
     };
     window.addEventListener('auth:unauthorized', onUnauthorized);
     return () => window.removeEventListener('auth:unauthorized', onUnauthorized);
-  }, []);
+  }, [navigate]);
 
   const refreshStats = () => {
     getStats().then(setStats).catch(() => {});
@@ -134,8 +174,7 @@ export default function App() {
     const res = await loginAuth({ username, password });
     setAuthToken(res.access_token);
     setUser(res.user);
-    setActiveTab('dashboard');
-    setSelectedProduct(null);
+    navigate('/', { replace: true });
     getStats().then(setStats).catch(() => setStats(null));
   };
 
@@ -143,9 +182,8 @@ export default function App() {
     if (AUTH_DISABLED) return;
     clearAuthToken();
     setUser(null);
-    setSelectedProduct(null);
     setStats(null);
-    setActiveTab('dashboard');
+    navigate('/login', { replace: true });
   };
 
   const handleChangePassword = async () => {
@@ -177,21 +215,22 @@ export default function App() {
     return (
       <div className="min-h-screen">
         <Toaster position="top-right" />
-        <LoginScreen onLogin={handleLogin} />
+        <Routes>
+          <Route path="/login" element={<LoginScreen onLogin={handleLogin} />} />
+          <Route path="*" element={<Navigate to="/login" replace />} />
+        </Routes>
       </div>
     );
   }
 
-  // Ürün detay görünümü
-  if (selectedProduct) {
+  // Ürün detay sayfası — tam ekran, layout dışında
+  if (location.pathname.startsWith('/products/') && location.pathname !== '/products') {
     return (
       <div className="min-h-screen">
         <Toaster position="top-right" />
-        <ProductDetail
-          sku={selectedProduct}
-          onBack={() => setSelectedProduct(null)}
-          onRefresh={refreshStats}
-        />
+        <Routes>
+          <Route path="/products/:sku" element={<ProductDetailRoute onRefresh={refreshStats} />} />
+        </Routes>
       </div>
     );
   }
@@ -284,7 +323,7 @@ export default function App() {
             {tabs.map(tab => (
               <button
                 key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
+                onClick={() => navigate(tab.path)}
                 className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
                   activeTab === tab.id
                     ? 'bg-blue-100 text-blue-700'
@@ -309,27 +348,15 @@ export default function App() {
 
       {/* Content */}
       <main className="max-w-7xl mx-auto px-4 py-6">
-        {activeTab === 'dashboard' && (
-          <Dashboard stats={stats} onRefresh={refreshStats} isAdmin={isAdmin} />
-        )}
-        {activeTab === 'inheritance' && (
-          <ParentInheritance onRefresh={refreshStats} />
-        )}
-        {activeTab === 'products' && (
-          <ProductBrowser
-            onSelectProduct={setSelectedProduct}
-            onRefresh={refreshStats}
-          />
-        )}
-        {activeTab === 'materials' && isAdmin && (
-          <MaterialManager onRefresh={refreshStats} />
-        )}
-        {activeTab === 'cost-propagation' && isAdmin && (
-          <CostPropagation />
-        )}
-        {activeTab === 'users' && isAdmin && (
-          <UserManager currentUser={currentUser} />
-        )}
+        <Routes>
+          <Route path="/" element={<Dashboard stats={stats} onRefresh={refreshStats} isAdmin={isAdmin} />} />
+          <Route path="/inheritance" element={<ParentInheritance onRefresh={refreshStats} />} />
+          <Route path="/products" element={<ProductBrowser onSelectProduct={(sku) => navigate(`/products/${encodeURIComponent(sku)}`)} onRefresh={refreshStats} />} />
+          <Route path="/materials" element={<AdminRoute isAdmin={isAdmin}><MaterialManager onRefresh={refreshStats} /></AdminRoute>} />
+          <Route path="/cost-propagation" element={<AdminRoute isAdmin={isAdmin}><CostPropagation /></AdminRoute>} />
+          <Route path="/users" element={<AdminRoute isAdmin={isAdmin}><UserManager currentUser={currentUser} /></AdminRoute>} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
       </main>
     </div>
   );
